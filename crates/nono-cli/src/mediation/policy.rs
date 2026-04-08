@@ -577,7 +577,7 @@ async fn exec_passthrough(
                 allowed_hosts: sb.network.allowed_hosts.clone(),
                 ..Default::default()
             };
-            match nono_proxy::start(proxy_config).await {
+            match nono_proxy::start(proxy_config, None).await {
                 Ok(handle) => {
                     for (k, v) in handle.env_vars() {
                         env.insert(k, v);

@@ -160,13 +160,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, proxy.active);
     }
 
-    let active_proxy = start_proxy_runtime(proxy, &mut caps)?;
-    let proxy_env_vars = active_proxy.env_vars;
-    let proxy_handle = active_proxy.handle;
-
-    // Build session audit context before mediation setup.
-    // session_id and session_name must be consistent between the mediation audit
-    // log and the session record written by supervised_runtime.
+    // Generate session context before proxy start so network audit events
+    // can be stamped with session identifiers from the first event.
+    // session_id and session_name must be consistent between the network audit
+    // log, the mediation audit log, and the session record.
     let mediation_session_id = std::env::var(crate::DETACHED_SESSION_ID_ENV)
         .ok()
         .filter(|id| !id.is_empty())
@@ -176,6 +173,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .session_name
         .clone()
         .unwrap_or_else(session::generate_random_name);
+
+    let proxy_session_ctx = if proxy.active {
+        Some(crate::proxy_runtime::ProxySessionContext {
+            session_id: mediation_session_id.clone(),
+            session_name: Some(mediation_session_name.clone()),
+            nono_pid: std::process::id(),
+        })
+    } else {
+        None
+    };
+
+    let active_proxy = start_proxy_runtime(proxy, &mut caps, proxy_session_ctx.as_ref())?;
+    let proxy_env_vars = active_proxy.env_vars;
+    let proxy_handle = active_proxy.handle;
     let sandboxed_pid_latch: Arc<OnceLock<u32>> = Arc::new(OnceLock::new());
     let audit_info = crate::mediation::SessionAuditInfo {
         session_id: mediation_session_id.clone(),

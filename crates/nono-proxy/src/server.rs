@@ -182,7 +182,10 @@ struct ProxyState {
 ///
 /// Returns a `ProxyHandle` with the assigned port and session token.
 /// The server runs until the handle is dropped or `shutdown()` is called.
-pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
+pub async fn start(
+    config: ProxyConfig,
+    audit_config: Option<audit::NetworkAuditConfig>,
+) -> Result<ProxyHandle> {
     // Generate session token
     let session_token = token::generate_session_token()?;
 
@@ -241,7 +244,7 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
 
     // Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let audit_log = audit::new_audit_log();
+    let audit_log = audit::new_audit_log(audit_config);
 
     // Compute NO_PROXY hosts: allowed_hosts minus credential upstreams.
     // Non-credential hosts bypass the proxy (direct connection, still
@@ -538,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_starts_and_binds() {
         let config = ProxyConfig::default();
-        let handle = start(config).await.unwrap();
+        let handle = start(config, None).await.unwrap();
 
         // Port should be non-zero (OS-assigned)
         assert!(handle.port > 0);
@@ -552,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_env_vars() {
         let config = ProxyConfig::default();
-        let handle = start(config).await.unwrap();
+        let handle = start(config, None).await.unwrap();
 
         let vars = handle.env_vars();
         let http_proxy = vars.iter().find(|(k, _)| k == "HTTP_PROXY");
@@ -591,7 +594,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let handle = start(config.clone()).await.unwrap();
+        let handle = start(config.clone(), None).await.unwrap();
 
         let vars = handle.credential_env_vars(&config);
         assert_eq!(vars.len(), 1);
@@ -610,7 +613,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: audit::new_audit_log(None),
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -660,7 +663,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: audit::new_audit_log(None),
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -714,7 +717,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: audit::new_audit_log(None),
             shutdown_tx,
             // Only "openai" was loaded; "github" credential was unavailable
             loaded_routes: ["openai".to_string()].into_iter().collect(),
@@ -786,7 +789,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 58406,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: audit::new_audit_log(None),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
@@ -858,7 +861,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: audit::new_audit_log(None),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: vec![
@@ -889,7 +892,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: audit::new_audit_log(None),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),

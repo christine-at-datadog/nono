@@ -179,9 +179,18 @@ pub(crate) fn build_proxy_config_from_flags(
     Ok(proxy_config)
 }
 
+/// Session context for network audit logging, threaded from `execution_runtime`
+/// into the proxy so events can be stamped with session identifiers.
+pub(crate) struct ProxySessionContext {
+    pub(crate) session_id: String,
+    pub(crate) session_name: Option<String>,
+    pub(crate) nono_pid: u32,
+}
+
 pub(crate) fn start_proxy_runtime(
     proxy: &ProxyLaunchOptions,
     caps: &mut CapabilitySet,
+    session_ctx: Option<&ProxySessionContext>,
 ) -> Result<ActiveProxyRuntime> {
     if !proxy.active {
         return Ok(ActiveProxyRuntime {
@@ -191,13 +200,25 @@ pub(crate) fn start_proxy_runtime(
     }
 
     let proxy_config = build_proxy_config_from_flags(proxy)?;
+
+    let audit_config = session_ctx.and_then(|ctx| {
+        crate::session::ensure_sessions_dir().ok().map(|dir| {
+            nono_proxy::audit::NetworkAuditConfig {
+                log_path: dir.join("network.jsonl"),
+                session_id: ctx.session_id.clone(),
+                session_name: ctx.session_name.clone(),
+                nono_pid: ctx.nono_pid,
+            }
+        })
+    });
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
     let handle = rt
-        .block_on(async { nono_proxy::server::start(proxy_config.clone()).await })
+        .block_on(async { nono_proxy::server::start(proxy_config.clone(), audit_config).await })
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy: {}", e)))?;
 
     let port = handle.port;
