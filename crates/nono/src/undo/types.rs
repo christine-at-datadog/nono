@@ -170,7 +170,7 @@ pub struct Change {
 }
 
 /// Proxy mode used for network audit events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAuditMode {
     /// CONNECT tunnel request
@@ -182,7 +182,7 @@ pub enum NetworkAuditMode {
 }
 
 /// Decision outcome for a network audit event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAuditDecision {
     /// Request was allowed
