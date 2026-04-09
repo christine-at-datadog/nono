@@ -506,17 +506,7 @@ const DATA_PROCESSING_PROFILE: &str = r#"{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
-    }
 
     /// Profiles written by `setup --profiles` must be loadable by `load_profile()`.
     ///
@@ -527,16 +517,22 @@ mod tests {
     /// `resolve_user_config_dir()` returning `~/.config`. This test catches that.
     #[test]
     fn test_setup_profiles_loadable_by_name() {
-        let _guard = env_lock();
-        let original_home = env::var("HOME").ok();
-        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
 
         let tmp = tempdir().expect("tempdir");
 
         // Point HOME at a tmpdir so both setup and loader derive paths
-        // under our control.
-        env::set_var("HOME", tmp.path());
-        env::remove_var("XDG_CONFIG_HOME");
+        // under our control. Set XDG_CONFIG_HOME to a placeholder so
+        // EnvVarGuard captures its original value, then remove it so the
+        // loader falls back to HOME-based resolution.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", tmp.path().to_str().expect("tmp path")),
+            ("XDG_CONFIG_HOME", "__placeholder__"),
+        ]);
+        _env.remove("XDG_CONFIG_HOME");
 
         // Run the actual setup code that writes example profiles.
         let runner = SetupRunner {
@@ -551,16 +547,6 @@ mod tests {
         let profile = crate::profile::load_profile("example-agent")
             .expect("example-agent profile written by setup was not found by load_profile()");
         assert_eq!(profile.meta.name, "example-agent");
-
-        // Restore env vars to avoid polluting parallel tests.
-        if let Some(home) = original_home {
-            env::set_var("HOME", home);
-        } else {
-            env::remove_var("HOME");
-        }
-        if let Some(xdg) = original_xdg {
-            env::set_var("XDG_CONFIG_HOME", xdg);
-        }
     }
 
     #[cfg(target_os = "linux")]

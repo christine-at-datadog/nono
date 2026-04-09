@@ -1212,6 +1212,7 @@ pub fn build_secret_mappings(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+#[allow(clippy::disallowed_methods)] // Tests use unique env var names (NONO_TEST_*), no contention.
 mod tests {
     use super::*;
 

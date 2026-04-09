@@ -34,8 +34,6 @@ struct ShimRequest {
     stdin: String,
     session_token: String,
     env: HashMap<String, String>,
-    /// PID of this shim process — used by the server as `command_pid` in audit logs.
-    pid: u32,
 }
 
 #[derive(Deserialize)]
@@ -54,8 +52,6 @@ struct AuditEvent {
     exit_code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     action_type: Option<String>,
-    /// PID of this shim process — the process that executed the logged command.
-    command_pid: u32,
 }
 
 /// Read piped stdin without blocking indefinitely.
@@ -167,7 +163,6 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         stdin,
         session_token,
         env,
-        pid: std::process::id(),
     };
 
     let request_bytes = match serde_json::to_vec(&request) {
@@ -269,7 +264,6 @@ fn send_audit_event(command_name: &str, args: &[String], exit_code: i32) {
         ts,
         exit_code,
         action_type: None,
-        command_pid: std::process::id(),
     };
 
     let bytes = match serde_json::to_vec(&event) {

@@ -1506,58 +1506,49 @@ mod tests {
     #[cfg(feature = "test-trust-overrides")]
     #[test]
     fn user_trust_policy_path_prefers_test_override() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let dir = tempfile::tempdir().unwrap();
         let override_path = dir.path().join("trust-policy.json");
-        let original = std::env::var(TEST_USER_POLICY_PATH_ENV).ok();
-
-        std::env::set_var(TEST_USER_POLICY_PATH_ENV, &override_path);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            TEST_USER_POLICY_PATH_ENV,
+            override_path.to_str().unwrap(),
+        )]);
         let resolved = user_trust_policy_path();
-
-        match original {
-            Some(value) => std::env::set_var(TEST_USER_POLICY_PATH_ENV, value),
-            None => std::env::remove_var(TEST_USER_POLICY_PATH_ENV),
-        }
 
         assert_eq!(resolved, Some(override_path));
     }
 
     #[test]
     fn load_trust_policy_returns_default_when_no_file() {
-        // Acquire the env mutex — this test modifies HOME, XDG_CONFIG_HOME, and CWD.
-        let _lock = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // CWD mutation with catch_unwind to guarantee cleanup even on panic.
+        // Isolate from real user config dir to avoid picking up invalid files.
         let dir = tempfile::tempdir().unwrap();
-        let original_cwd = std::env::current_dir().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let original = std::env::current_dir().unwrap();
         let xdg_dir = dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("XDG_CONFIG_HOME", xdg_dir.to_str().unwrap()),
+            ("HOME", dir.path().to_str().unwrap()),
+        ]);
 
-        // Override HOME so dirs::config_dir() won't find a real user-level policy.
-        std::env::set_var("HOME", dir.path());
-        std::env::set_current_dir(dir.path()).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            std::env::set_current_dir(dir.path()).unwrap();
+            let policy = load_trust_policy(None).unwrap();
+            assert!(
+                policy.publishers.is_empty(),
+                "expected empty publishers when no policy file exists, got: {:?}",
+                policy.publishers,
+            );
+        });
 
-        let policy_result = load_trust_policy(None);
-
-        // Restore env before any assertions to avoid poisoning other tests.
-        std::env::set_current_dir(original_cwd).unwrap();
-        match original_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        match orig_xdg {
-            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-
-        let policy = policy_result.unwrap();
-        assert!(
-            policy.publishers.is_empty(),
-            "expected empty publishers when no policy file exists, got: {:?}",
-            policy.publishers,
-        );
+        std::env::set_current_dir(original).unwrap();
+        result.unwrap();
     }
 }

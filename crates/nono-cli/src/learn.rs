@@ -2130,12 +2130,12 @@ mod tests {
 
     #[test]
     fn test_expand_home() {
-        let _env_guard = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let original_home = std::env::var("HOME").ok();
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/test")]);
 
-        std::env::set_var("HOME", "/home/test");
         assert_eq!(expand_home("~/foo").expect("valid home"), "/home/test/foo");
         assert_eq!(
             expand_home("$HOME/bar").expect("valid home"),
@@ -2145,12 +2145,6 @@ mod tests {
             expand_home("/absolute/path").expect("no expansion needed"),
             "/absolute/path"
         );
-
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]

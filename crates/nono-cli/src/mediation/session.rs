@@ -10,12 +10,12 @@
 use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
-use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo};
+use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
 use nix::libc;
 use nono::{NonoError, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
@@ -74,9 +74,6 @@ pub struct SessionHandle {
     pub mediated_commands: Vec<String>,
     /// Path to the audit datagram socket for fire-and-forget command logging.
     pub audit_socket_path: PathBuf,
-    /// Latch set to the sandboxed process PID after the sandboxed process is forked.
-    /// Callers must call `latch.set(sandboxed_pid)` in their post-fork callback.
-    pub sandboxed_pid_latch: Arc<OnceLock<u32>>,
     // Tokio runtime kept alive so the server task continues running in the parent.
     _runtime: tokio::runtime::Runtime,
 }
@@ -107,12 +104,10 @@ impl Drop for SessionHandle {
 /// # Errors
 /// Returns an error if a command cannot be resolved, or the session directory /
 /// symlinks cannot be created.
-pub fn setup(config: &MediationConfig, audit_info: SessionAuditInfo) -> Result<Option<SessionHandle>> {
+pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     if !config.is_active() {
         return Ok(None);
     }
-    let sandboxed_pid_latch = Arc::clone(&audit_info.sandboxed_pid);
-    let audit_info_arc = Arc::new(audit_info);
 
     cleanup_orphaned_sessions();
 
@@ -305,7 +300,6 @@ pub fn setup(config: &MediationConfig, audit_info: SessionAuditInfo) -> Result<O
     let gate_clone = Arc::clone(&approval_gate);
     let audit_sock = audit_socket_path.clone();
     let audit_log_dir = crate::session::ensure_sessions_dir()?;
-    let audit_info_for_server = Arc::clone(&audit_info_arc);
     runtime.spawn(async move {
         if let Err(e) = super::server::run(
             sock,
@@ -317,7 +311,6 @@ pub fn setup(config: &MediationConfig, audit_info: SessionAuditInfo) -> Result<O
             gate_clone,
             audit_sock,
             audit_log_dir,
-            audit_info_for_server,
         )
         .await
         {
@@ -358,7 +351,6 @@ pub fn setup(config: &MediationConfig, audit_info: SessionAuditInfo) -> Result<O
         admin_state,
         mediated_commands,
         audit_socket_path,
-        sandboxed_pid_latch,
         _runtime: runtime,
     }))
 }
@@ -607,13 +599,7 @@ mod tests {
     #[test]
     fn test_setup_returns_none_when_inactive() {
         let config = MediationConfig::default();
-        let dummy_audit = crate::mediation::SessionAuditInfo {
-            session_id: String::new(),
-            session_name: None,
-            nono_pid: std::process::id(),
-            sandboxed_pid: std::sync::Arc::new(std::sync::OnceLock::new()),
-        };
-        let result = setup(&config, dummy_audit).expect("setup should not fail for inactive config");
+        let result = setup(&config).expect("setup should not fail for inactive config");
         assert!(result.is_none());
     }
 

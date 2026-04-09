@@ -188,15 +188,51 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
     let sandboxed_pid_latch: Arc<OnceLock<u32>> = Arc::new(OnceLock::new());
-    let audit_info = crate::mediation::SessionAuditInfo {
-        session_id: mediation_session_id.clone(),
-        session_name: Some(mediation_session_name.clone()),
-        nono_pid: std::process::id(),
-        sandboxed_pid: Arc::clone(&sandboxed_pid_latch),
-    };
 
     // Set up command mediation (shim dir, server, env blocking) before sandbox.
-    let mediation_handle = crate::mediation::session::setup(&flags.mediation, audit_info)?;
+    let mediation_handle = crate::mediation::session::setup(&flags.mediation)?;
+
+    // If mediation is active, add shim directory and binary to sandbox rules.
+    let mediation_path_str;
+    let mediation_socket_str;
+    let mediation_token_str;
+    let mut mediation_env_block: Vec<String> = Vec::new();
+    if let Some(ref handle) = mediation_handle {
+        // Prepend shim dir to PATH so the agent calls our shims instead of real binaries.
+        mediation_path_str = handle.shim_dir.display().to_string();
+        mediation_socket_str = handle.socket_path.display().to_string();
+        mediation_token_str = handle.session_token.to_string();
+        mediation_env_block = handle.env_block.clone();
+
+        // Allow sandbox to read the shim binary and session directory.
+        caps.add_fs(
+            nono::FsCapability::new_dir(&handle.shim_dir, nono::AccessMode::Read)
+                .map_err(|e| nono::NonoError::SandboxInit(format!("mediation shim dir: {e}")))?,
+        );
+        caps.add_fs(
+            nono::FsCapability::new_file(&handle.shim_binary, nono::AccessMode::Read)
+                .map_err(|e| nono::NonoError::SandboxInit(format!("mediation shim binary: {e}")))?,
+        );
+        // Allow sandbox to access the session directory (contains the mediation
+        // and audit sockets, created asynchronously by the server).
+        caps.add_fs(
+            nono::FsCapability::new_dir(&handle.session_dir, nono::AccessMode::ReadWrite)
+                .map_err(|e| nono::NonoError::SandboxInit(format!("mediation session dir: {e}")))?,
+        );
+
+        info!(
+            "Mediation session active: {} commands mediated, shim_dir={}",
+            handle.mediated_commands.len(),
+            handle.shim_dir.display()
+        );
+    } else {
+        mediation_path_str = String::new();
+        mediation_socket_str = String::new();
+        mediation_token_str = String::new();
+    }
+
+    // Set up command mediation (shim dir, server, env blocking) before sandbox.
+    let mediation_handle = crate::mediation::session::setup(&flags.mediation)?;
 
     // If mediation is active, add shim directory and binary to sandbox rules.
     let mediation_path_str;

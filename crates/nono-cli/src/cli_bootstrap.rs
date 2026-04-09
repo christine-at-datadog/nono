@@ -116,6 +116,7 @@ pub(crate) fn init_tracing(cli: &Cli) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // Single-threaded at process startup, before any threads.
 fn copy_legacy_env_var(old: &str, new: &str) {
     if std::env::var_os(new).is_some() {
         return;

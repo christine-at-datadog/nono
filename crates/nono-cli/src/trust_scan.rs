@@ -1147,15 +1147,6 @@ fn format_identity(identity: &trust::SignerIdentity) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        match ENV_LOCK.get_or_init(|| Mutex::new(())).lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
 
     #[test]
     fn scan_empty_dir_returns_empty_result() {
@@ -1367,14 +1358,19 @@ mod tests {
 
     #[test]
     fn load_scan_policy_with_trust_override_skips_verification() {
-        let _guard = env_lock();
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let dir = tempfile::tempdir().unwrap();
         // Isolate from the real user config dir so a stale trust-policy.json
         // on the developer's machine doesn't interfere with the test.
-        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_dir = dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            xdg_dir.to_str().unwrap(),
+        )]);
 
         // Create a policy file with no .bundle — should still load with trust_override=true
         std::fs::write(
@@ -1385,37 +1381,27 @@ mod tests {
 
         // Redirect HOME so dirs::config_dir() returns a path with no user policy,
         // preventing the real user policy from polluting this test.
-        // Hold the process-wide env lock for the duration of the HOME modification.
-        let _env_guard = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", dir.path());
+        let _env_home =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", dir.path().to_str().unwrap())]);
         let policy = load_scan_policy(dir.path(), true, &[]);
-        if let Some(ref h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        drop(_env_guard);
         let policy = policy.expect("load_scan_policy should succeed with trust_override=true");
         assert_eq!(policy.enforcement, Enforcement::Warn);
-
-        match orig_xdg {
-            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     #[test]
     fn load_scan_policy_skips_policy_verification_without_signed_artifacts() {
-        let _guard = env_lock();
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let scan_dir = tempfile::tempdir().unwrap();
         let include_pattern = "*.arbitrary";
-        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_dir = scan_dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            xdg_dir.to_str().unwrap(),
+        )]);
 
         std::fs::write(scan_dir.path().join("notes.arbitrary"), "unsigned").unwrap();
 
@@ -1430,11 +1416,6 @@ mod tests {
 
         let policy = load_scan_policy(scan_dir.path(), false, &[]).unwrap();
         assert!(policy.includes.contains(&include_pattern.to_string()));
-
-        match orig_xdg {
-            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     #[test]
