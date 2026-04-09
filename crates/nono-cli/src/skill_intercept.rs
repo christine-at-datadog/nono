@@ -12,6 +12,88 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
+/// Configuration for skill verification audit logging.
+#[derive(Debug, Clone)]
+pub struct SkillAuditConfig {
+    /// Path to the skills.jsonl log file.
+    pub log_path: PathBuf,
+    /// Session identifier (shared with network audit and mediation logs).
+    pub session_id: String,
+    /// Human-readable session name.
+    pub session_name: Option<String>,
+    /// PID of the nono supervisor process.
+    pub nono_pid: u32,
+}
+
+/// A single skill audit log line, serialized to JSONL.
+#[derive(serde::Serialize)]
+struct SkillAuditLine<'a> {
+    timestamp_unix_ms: u64,
+    skill_dir: &'a str,
+    skill_name: Option<&'a str>,
+    publisher: Option<&'a str>,
+    version: Option<&'a str>,
+    decision: &'a str,
+    reason: Option<&'a str>,
+    session_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_name: Option<&'a str>,
+    nono_pid: u32,
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn append_skill_audit_log(
+    config: &SkillAuditConfig,
+    skill_dir: &Path,
+    skill_name: Option<&str>,
+    publisher: Option<&str>,
+    version: Option<&str>,
+    decision: &str,
+    reason: Option<&str>,
+) {
+    use std::io::Write;
+
+    let line = SkillAuditLine {
+        timestamp_unix_ms: current_timestamp_ms(),
+        skill_dir: &skill_dir.to_string_lossy(),
+        skill_name,
+        publisher,
+        version,
+        decision,
+        reason,
+        session_id: &config.session_id,
+        session_name: config.session_name.as_deref(),
+        nono_pid: config.nono_pid,
+    };
+
+    let Ok(json) = serde_json::to_string(&line) else {
+        warn!("Failed to serialize skill audit event");
+        return;
+    };
+
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.log_path)
+    else {
+        warn!(
+            "Failed to open skill audit log: {}",
+            config.log_path.display()
+        );
+        return;
+    };
+
+    if let Err(e) = writeln!(file, "{json}") {
+        warn!("Failed to write skill audit event: {e}");
+    }
+}
+
 /// Cached skill verification result.
 #[derive(Debug, Clone)]
 struct SkillCacheEntry {
@@ -62,6 +144,8 @@ pub struct SkillInterceptor {
     skill_roots: Vec<PathBuf>,
     /// Discovered skill directories (populated on first access)
     discovered: Option<Vec<PathBuf>>,
+    /// Optional audit logging configuration
+    audit_config: Option<SkillAuditConfig>,
 }
 
 impl SkillInterceptor {
@@ -71,12 +155,17 @@ impl SkillInterceptor {
     /// (e.g., `~/.claude/plugins/`). Each subdirectory containing a
     /// `skill-manifest.json` is treated as a skill directory.
     #[must_use]
-    pub fn new(policy: TrustPolicy, skill_roots: Vec<PathBuf>) -> Self {
+    pub fn new(
+        policy: TrustPolicy,
+        skill_roots: Vec<PathBuf>,
+        audit_config: Option<SkillAuditConfig>,
+    ) -> Self {
         Self {
             policy,
             cache: HashMap::new(),
             skill_roots,
             discovered: None,
+            audit_config,
         }
     }
 
@@ -213,6 +302,17 @@ impl SkillInterceptor {
                         name: result.name.clone(),
                         version: result.version.clone(),
                     };
+                    if let Some(ref config) = self.audit_config {
+                        append_skill_audit_log(
+                            config,
+                            skill_dir,
+                            Some(&result.name),
+                            Some(publisher),
+                            Some(&result.version),
+                            "allowed",
+                            None,
+                        );
+                    }
                     self.store_cache(
                         skill_dir,
                         CachedSkillOutcome::Verified {
@@ -230,6 +330,17 @@ impl SkillInterceptor {
                 }
                 outcome => {
                     let reason = format_skill_outcome(outcome);
+                    if let Some(ref config) = self.audit_config {
+                        append_skill_audit_log(
+                            config,
+                            skill_dir,
+                            Some(&result.name),
+                            None,
+                            Some(&result.version),
+                            "denied",
+                            Some(&reason),
+                        );
+                    }
                     self.store_cache(
                         skill_dir,
                         CachedSkillOutcome::Failed {
@@ -246,6 +357,17 @@ impl SkillInterceptor {
             },
             Err(e) => {
                 let reason = format!("verification error: {e}");
+                if let Some(ref config) = self.audit_config {
+                    append_skill_audit_log(
+                        config,
+                        skill_dir,
+                        None,
+                        None,
+                        None,
+                        "error",
+                        Some(&reason),
+                    );
+                }
                 self.store_cache(
                     skill_dir,
                     CachedSkillOutcome::Failed {
@@ -322,7 +444,7 @@ mod tests {
     fn interceptor_returns_none_for_non_skill_paths() {
         let dir = tempfile::tempdir().unwrap();
         let policy = TrustPolicy::default();
-        let mut interceptor = SkillInterceptor::new(policy, vec![dir.path().to_path_buf()]);
+        let mut interceptor = SkillInterceptor::new(policy, vec![dir.path().to_path_buf()], None);
 
         assert!(interceptor
             .check_path(Path::new("/tmp/random/file.txt"))
@@ -337,7 +459,7 @@ mod tests {
         std::fs::write(plugin_dir.join(trust::SKILL_MANIFEST_FILENAME), "{}").unwrap();
 
         let policy = TrustPolicy::default();
-        let mut interceptor = SkillInterceptor::new(policy, vec![root.path().to_path_buf()]);
+        let mut interceptor = SkillInterceptor::new(policy, vec![root.path().to_path_buf()], None);
 
         // A path within the plugin dir should trigger verification
         let result = interceptor.check_path(&plugin_dir.join("commands/deploy.md"));
@@ -349,7 +471,7 @@ mod tests {
 
     #[test]
     fn verified_and_unverified_dirs_tracking() {
-        let interceptor = SkillInterceptor::new(TrustPolicy::default(), vec![]);
+        let interceptor = SkillInterceptor::new(TrustPolicy::default(), vec![], None);
         assert!(interceptor.verified_skill_dirs().is_empty());
         assert!(interceptor.unverified_skill_dirs().is_empty());
     }
@@ -361,5 +483,127 @@ mod tests {
             reason: "evil".to_string()
         })
         .contains("blocklisted"));
+    }
+
+    #[test]
+    fn audit_log_writes_jsonl_on_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("my-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join(trust::SKILL_MANIFEST_FILENAME), "{}").unwrap();
+
+        let log_path = root.path().join("skills.jsonl");
+        let audit_config = SkillAuditConfig {
+            log_path: log_path.clone(),
+            session_id: "test-session-123".to_string(),
+            session_name: Some("test-session".to_string()),
+            nono_pid: 42,
+        };
+
+        let policy = TrustPolicy::default();
+        let mut interceptor =
+            SkillInterceptor::new(policy, vec![root.path().to_path_buf()], Some(audit_config));
+
+        // Trigger verification (will fail because manifest is invalid)
+        let result = interceptor.check_path(&plugin_dir.join("commands/deploy.md"));
+        assert!(result.is_some());
+
+        // The audit log should have been written
+        assert!(log_path.exists(), "skills.jsonl should exist");
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = contents.trim().lines().collect();
+        assert_eq!(lines.len(), 1, "should have exactly one audit line");
+
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert!(
+            parsed["decision"] == "denied" || parsed["decision"] == "error",
+            "invalid manifest should produce denied or error decision"
+        );
+        assert_eq!(parsed["session_id"], "test-session-123");
+        assert_eq!(parsed["session_name"], "test-session");
+        assert_eq!(parsed["nono_pid"], 42);
+        assert!(parsed["timestamp_unix_ms"].as_u64().unwrap() > 0);
+        assert!(parsed["skill_dir"].as_str().unwrap().contains("my-plugin"));
+    }
+
+    #[test]
+    fn audit_log_not_written_without_config() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("my-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join(trust::SKILL_MANIFEST_FILENAME), "{}").unwrap();
+
+        let log_path = root.path().join("skills.jsonl");
+        let policy = TrustPolicy::default();
+        let mut interceptor =
+            SkillInterceptor::new(policy, vec![root.path().to_path_buf()], None);
+
+        // Trigger verification
+        let _ = interceptor.check_path(&plugin_dir.join("commands/deploy.md"));
+
+        // No audit log should be created
+        assert!(!log_path.exists(), "skills.jsonl should not exist without audit config");
+    }
+
+    #[test]
+    fn audit_log_cached_hits_are_not_re_logged() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("my-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join(trust::SKILL_MANIFEST_FILENAME), "{}").unwrap();
+
+        let log_path = root.path().join("skills.jsonl");
+        let audit_config = SkillAuditConfig {
+            log_path: log_path.clone(),
+            session_id: "test-session".to_string(),
+            session_name: None,
+            nono_pid: 1,
+        };
+
+        let policy = TrustPolicy::default();
+        let mut interceptor =
+            SkillInterceptor::new(policy, vec![root.path().to_path_buf()], Some(audit_config));
+
+        // First access: triggers verification and audit log
+        let _ = interceptor.check_path(&plugin_dir.join("commands/deploy.md"));
+        // Second access: cache hit, should NOT re-log
+        let _ = interceptor.check_path(&plugin_dir.join("commands/other.md"));
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = contents.trim().lines().collect();
+        assert_eq!(lines.len(), 1, "cached lookups should not produce additional audit lines");
+    }
+
+    #[test]
+    fn append_skill_audit_log_writes_valid_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("skills.jsonl");
+        let config = SkillAuditConfig {
+            log_path: log_path.clone(),
+            session_id: "sid-1".to_string(),
+            session_name: Some("my-session".to_string()),
+            nono_pid: 99,
+        };
+
+        append_skill_audit_log(
+            &config,
+            Path::new("/plugins/my-skill"),
+            Some("my-skill"),
+            Some("acme-corp"),
+            Some("1.2.3"),
+            "allowed",
+            None,
+        );
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(parsed["skill_name"], "my-skill");
+        assert_eq!(parsed["publisher"], "acme-corp");
+        assert_eq!(parsed["version"], "1.2.3");
+        assert_eq!(parsed["decision"], "allowed");
+        assert!(parsed.get("reason").unwrap().is_null());
+        assert_eq!(parsed["session_id"], "sid-1");
+        assert_eq!(parsed["session_name"], "my-session");
+        assert_eq!(parsed["nono_pid"], 99);
     }
 }
