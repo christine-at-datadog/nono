@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
-pub(crate) use env_sanitization::validate_allow_vars_pattern;
+pub(crate) use env_sanitization::validate_env_var_patterns;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -69,32 +69,45 @@ const MAX_CRYPTO_THREADS: usize = 12;
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
 const MAX_TRACKED_REQUEST_IDS: usize = 4096;
+/// Quiet period used to drain final PTY output after child exit before parent
+/// diagnostics/prompts take over the terminal.
+const POST_EXIT_PTY_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+
+struct ProfileSaveOffer<'a> {
+    policy_explanations: &'a [nono::diagnostic::PolicyExplanation],
+    error_observation: &'a nono::diagnostic::ErrorObservation,
+    caps: &'a CapabilitySet,
+    command: &'a [String],
+    compared_profile: Option<&'a str>,
+    sandbox_violations: &'a [nono::SandboxViolation],
+    ignored_denial_paths: &'a [std::path::PathBuf],
+}
 
 fn offer_profile_save_for_child(
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
-    policy_explanations: &[nono::diagnostic::PolicyExplanation],
-    error_observation: &nono::diagnostic::ErrorObservation,
-    caps: &CapabilitySet,
-    command: &[String],
-    compared_profile: Option<&str>,
+    offer: ProfileSaveOffer<'_>,
 ) -> Result<()> {
     if let Some(proxy) = pty {
         let _released_terminal = proxy.release_terminal_for_prompt();
         return crate::profile_save_runtime::offer_save_run_profile(
-            policy_explanations,
-            error_observation,
-            caps,
-            command,
-            compared_profile,
+            offer.policy_explanations,
+            offer.error_observation,
+            offer.caps,
+            offer.command,
+            offer.compared_profile,
+            offer.sandbox_violations,
+            offer.ignored_denial_paths,
         );
     }
 
     crate::profile_save_runtime::offer_save_run_profile(
-        policy_explanations,
-        error_observation,
-        caps,
-        command,
-        compared_profile,
+        offer.policy_explanations,
+        offer.error_observation,
+        offer.caps,
+        offer.command,
+        offer.compared_profile,
+        offer.sandbox_violations,
+        offer.ignored_denial_paths,
     )
 }
 
@@ -202,6 +215,8 @@ pub struct ExecConfig<'a> {
     pub protected_paths: &'a [std::path::PathBuf],
     /// Base profile name to derive a saved user patch from after run-time denials.
     pub profile_save_base: Option<&'a str>,
+    /// Denied paths that should not be offered in the save-profile prompt.
+    pub ignored_denial_paths: &'a [std::path::PathBuf],
     /// Optional startup timeout for known interactive CLIs that were launched
     /// without their recommended built-in profile.
     pub startup_timeout: Option<StartupTimeoutConfig<'a>>,
@@ -221,6 +236,10 @@ pub struct ExecConfig<'a> {
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
     pub allowed_env_vars: Option<Vec<String>>,
+    /// Deny-list of environment variable names. Variables matching an exact
+    /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
+    /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
+    pub denied_env_vars: Option<Vec<String>>,
     /// Additional env var names to block from the child (from mediation.env.block).
     /// Complements the hardcoded injection-vector list in env_sanitization.rs.
     pub extra_blocked_env: &'a [String],
@@ -258,6 +277,8 @@ pub struct SupervisorConfig<'a> {
     pub open_url_allow_localhost: bool,
     /// Optional append-only audit recorder for supervisor events.
     pub audit_recorder: Option<&'a Mutex<crate::audit_integrity::AuditRecorder>>,
+    /// Redaction policy for command context in diagnostics.
+    pub redaction_policy: &'a nono::ScrubPolicy,
     /// Whether direct LaunchServices opening is enabled for this session.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub allow_launch_services_active: bool,
@@ -312,6 +333,11 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
         if should_skip_env_var(&key, &config.env_vars, &extra_blocked) {
             continue;
         }
+        if let Some(ref denied) = config.denied_env_vars {
+            if env_sanitization::is_env_var_denied(&key, denied) {
+                continue;
+            }
+        }
         if let Some(ref allowed) = config.allowed_env_vars {
             if !env_sanitization::is_env_var_allowed(&key, allowed) {
                 continue;
@@ -362,8 +388,9 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 /// 4. Child: apply Landlock, install seccomp-notify, close inherited FDs, exec
 /// 5. Parent: apply PR_SET_DUMPABLE(0) + PT_DENY_ATTACH, receive seccomp fd, run supervisor loop
 ///
-/// Does NOT pipe stdout/stderr. The child inherits the parent's terminal directly,
-/// preserving TTY semantics for interactive programs (e.g., Claude Code, vim).
+/// When a PTY pair is provided, the child runs behind the PTY proxy so the
+/// parent can capture terminal output for diagnostics while the child still sees
+/// a TTY. Otherwise the child inherits the parent's terminal directly.
 /// The parent prints diagnostics and rollback UI after the child exits.
 pub fn execute_supervised(
     config: &ExecConfig<'_>,
@@ -439,6 +466,11 @@ pub fn execute_supervised(
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
             if should_skip_env_var(k, &config.env_vars, &extra_blocked_supervised) {
                 continue;
+            }
+            if let Some(ref denied) = config.denied_env_vars {
+                if env_sanitization::is_env_var_denied(k, denied) {
+                    continue;
+                }
             }
             if let Some(ref allowed) = config.allowed_env_vars {
                 if !env_sanitization::is_env_var_allowed(k, allowed) {
@@ -1102,7 +1134,9 @@ pub fn execute_supervised(
             // attaching client gets EPIPE ("Broken pipe") when it
             // tries to send the handshake.
             if let Some(ref mut p) = pty_proxy {
+                p.drain_master_output(POST_EXIT_PTY_DRAIN_TIMEOUT);
                 p.shutdown_attach_listener();
+                p.release_terminal_for_prompt();
             }
 
             let exit_code = match status {
@@ -1145,23 +1179,40 @@ pub fn execute_supervised(
                 DiagnosticMode::Standard
             };
 
-            let should_print_diagnostics = !config.no_diagnostics
-                && (exit_code != 0 || !denials.is_empty() || error_observation.has_findings());
+            #[cfg(target_os = "macos")]
+            let sandbox_violations = if supervisor.is_some() {
+                let include_historical_sandbox_log =
+                    exit_code != 0 || !denials.is_empty() || error_observation.has_findings();
+                match sandbox_log_collector {
+                    Some(collector) if include_historical_sandbox_log => collector.finish(),
+                    Some(collector) => collector.finish_realtime_only(),
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let sandbox_violations = Vec::new();
+
+            // Resolve policy explanations for denied paths so the diagnostic
+            // can show group names and fix guidance inline. On macOS this is
+            // also the source for the run-time profile save prompt.
+            let policy_explanations =
+                build_policy_explanations(&denials, &sandbox_violations, config.caps);
+            let prompt_policy_explanations = policy_explanations.clone();
+            let prompt_error_observation = error_observation.clone();
+
+            let should_print_diagnostics = should_print_diagnostic_footer(
+                config.no_diagnostics,
+                exit_code,
+                &denials,
+                &sandbox_violations,
+                &error_observation,
+            );
 
             // Print diagnostic footer on non-zero exit or when the PTY
-            // output shows a likely sandbox-related issue.
+            // output or OS sandbox logs show a likely sandbox-related issue.
             if should_print_diagnostics {
-                #[cfg(target_os = "macos")]
-                let sandbox_violations = if supervisor.is_some() {
-                    sandbox_log_collector
-                        .map(crate::sandbox_log::SandboxLogCollector::finish)
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                #[cfg(not(target_os = "macos"))]
-                let sandbox_violations = Vec::new();
-
                 let diag_session_id = if supervisor.is_some() {
                     pty_session_id
                         .or_else(|| supervisor.map(|s| s.session_id))
@@ -1170,12 +1221,13 @@ pub fn execute_supervised(
                     None
                 };
 
-                // Resolve policy explanations for denied paths so the
-                // diagnostic can show group names and fix guidance inline.
-                let policy_explanations =
-                    build_policy_explanations(&denials, &sandbox_violations, config.caps);
-                let prompt_policy_explanations = policy_explanations.clone();
-                let prompt_error_observation = error_observation.clone();
+                let default_redaction_policy;
+                let redaction_policy = if let Some(supervisor_config) = supervisor {
+                    supervisor_config.redaction_policy
+                } else {
+                    default_redaction_policy = nono::ScrubPolicy::secure_default();
+                    &default_redaction_policy
+                };
 
                 let mut formatter = DiagnosticFormatter::new(config.caps)
                     .with_mode(mode)
@@ -1190,26 +1242,36 @@ pub fn execute_supervised(
                     formatter = formatter.with_command(nono::diagnostic::CommandContext {
                         program: program.clone(),
                         resolved_path: config.resolved_program.to_path_buf(),
-                        args: config.command.to_vec(),
+                        args: nono::scrub_argv_with_policy(config.command, redaction_policy),
                     });
                 }
                 let footer = formatter.format_footer(exit_code);
                 crate::output::print_diagnostic_footer(&footer);
+            }
 
-                if exit_code != 0 {
-                    // Clear the forwarding target before prompting. The child is
-                    // already dead; keeping CHILD_PID set would cause forward_signal
-                    // to send Ctrl-C to the dead PID, swallowing it silently.
-                    clear_signal_forwarding_target();
-                    offer_profile_save_for_child(
-                        pty_proxy.as_mut(),
-                        &prompt_policy_explanations,
-                        &prompt_error_observation,
-                        config.caps,
-                        config.command,
-                        config.profile_save_base,
-                    )?;
-                }
+            if should_offer_profile_save(
+                config.no_diagnostics,
+                exit_code,
+                &prompt_policy_explanations,
+                &prompt_error_observation,
+                &sandbox_violations,
+            ) {
+                // Clear the forwarding target before prompting. The child is
+                // already dead; keeping CHILD_PID set would cause forward_signal
+                // to send Ctrl-C to the dead PID, swallowing it silently.
+                clear_signal_forwarding_target();
+                offer_profile_save_for_child(
+                    pty_proxy.as_mut(),
+                    ProfileSaveOffer {
+                        policy_explanations: &prompt_policy_explanations,
+                        error_observation: &prompt_error_observation,
+                        caps: config.caps,
+                        command: config.command,
+                        compared_profile: config.profile_save_base,
+                        sandbox_violations: &sandbox_violations,
+                        ignored_denial_paths: config.ignored_denial_paths,
+                    },
+                )?;
             }
 
             Ok(exit_code)
@@ -1267,6 +1329,15 @@ fn build_policy_explanations(
             .or_insert(access);
     }
 
+    if has_keychain_service_violation(sandbox_violations) {
+        if let Some(path) = login_keychain_db_path() {
+            paths
+                .entry(path)
+                .and_modify(|a| *a = merge(*a, AccessMode::Read))
+                .or_insert(AccessMode::Read);
+        }
+    }
+
     let mut explanations = Vec::new();
     for (path, access) in paths {
         match crate::query_ext::query_path(&path, access, caps, &[]) {
@@ -1295,6 +1366,61 @@ fn build_policy_explanations(
     }
 
     explanations
+}
+
+fn has_keychain_service_violation(violations: &[nono::SandboxViolation]) -> bool {
+    violations.iter().any(|violation| {
+        violation.operation == "mach-lookup"
+            && violation
+                .target
+                .as_deref()
+                .is_some_and(is_keychain_service_name)
+    })
+}
+
+fn is_keychain_service_name(service: &str) -> bool {
+    matches!(
+        service,
+        "com.apple.SecurityServer"
+            | "com.apple.securityd"
+            | "com.apple.security.keychaind"
+            | "com.apple.secd"
+            | "com.apple.security.agent"
+    )
+}
+
+fn login_keychain_db_path() -> Option<PathBuf> {
+    crate::config::validated_home()
+        .ok()
+        .map(|home| PathBuf::from(home).join("Library/Keychains/login.keychain-db"))
+}
+
+fn should_print_diagnostic_footer(
+    no_diagnostics: bool,
+    exit_code: i32,
+    denials: &[nono::diagnostic::DenialRecord],
+    sandbox_violations: &[nono::SandboxViolation],
+    error_observation: &nono::diagnostic::ErrorObservation,
+) -> bool {
+    !no_diagnostics
+        && (exit_code != 0
+            || !denials.is_empty()
+            || !sandbox_violations.is_empty()
+            || error_observation.has_findings())
+}
+
+fn should_offer_profile_save(
+    no_diagnostics: bool,
+    exit_code: i32,
+    policy_explanations: &[nono::diagnostic::PolicyExplanation],
+    error_observation: &nono::diagnostic::ErrorObservation,
+    sandbox_violations: &[nono::SandboxViolation],
+) -> bool {
+    !no_diagnostics
+        && (exit_code != 0
+            || !policy_explanations.is_empty()
+            || !error_observation.path_hints.is_empty()
+            || crate::profile_save_runtime::has_saveable_system_service_rules(sandbox_violations))
 }
 
 /// Close inherited file descriptors, keeping stdin/stdout/stderr and specified FDs.
@@ -1399,7 +1525,7 @@ fn wait_for_child_with_pty(
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    let has_output = pty.has_observed_output();
+                    let has_output = pty.has_visible_output();
                     if Instant::now() >= deadline && !has_output && !startup_prompted {
                         startup_prompted = true;
                         let terminate = prompt_startup_termination_for_child(
@@ -1647,8 +1773,8 @@ fn detach_client_for_session(pty: &mut crate::pty_proxy::PtyProxy) -> bool {
     pty.detach()
 }
 
-fn restore_terminal_after_detach() {
-    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO);
+fn restore_terminal_after_detach(in_alt_screen: bool) {
+    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO, in_alt_screen);
     crate::pty_proxy::write_detach_notice(libc::STDERR_FILENO);
 }
 
@@ -1660,7 +1786,9 @@ fn handle_pty_poll_events(
     resize_revents: libc::c_short,
     loop_name: &str,
 ) -> bool {
-    if master_revents & libc::POLLIN != 0 && !pty.proxy_master_to_client() {
+    if master_revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        && !pty.proxy_master_to_client()
+    {
         debug!("Stopping {loop_name} after PTY master relay failure");
         return false;
     }
@@ -1688,8 +1816,13 @@ fn handle_pty_detach_request(
     if in_band_detach_requested {
         info!("PTY detach requested via in-band key sequence");
     }
-    if (pause_requested || in_band_detach_requested) && pty.is_some_and(detach_client_for_session) {
-        restore_terminal_after_detach();
+    if let Some(p) = pty {
+        if pause_requested || in_band_detach_requested {
+            let in_alt_screen = p.in_alt_screen();
+            if detach_client_for_session(p) {
+                restore_terminal_after_detach(in_alt_screen);
+            }
+        }
     }
 }
 
@@ -1875,7 +2008,7 @@ fn run_supervisor_loop(
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    let has_output = pty.as_ref().is_some_and(|p| p.has_observed_output());
+                    let has_output = pty.as_ref().is_some_and(|p| p.has_visible_output());
                     if Instant::now() >= deadline && !has_output && !startup_prompted {
                         startup_prompted = true;
                         let terminate = prompt_startup_termination_for_child(
@@ -2119,7 +2252,7 @@ fn run_supervisor_loop(
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    let has_output = pty.as_ref().is_some_and(|p| p.has_observed_output());
+                    let has_output = pty.as_ref().is_some_and(|p| p.has_visible_output());
                     if Instant::now() >= deadline && !has_output && !startup_prompted {
                         startup_prompted = true;
                         let terminate = prompt_startup_termination_for_child(
@@ -3214,6 +3347,118 @@ mod tests {
     }
 
     #[test]
+    fn test_diagnostic_footer_triggers_on_successful_sandbox_violation() {
+        let violations = vec![nono::SandboxViolation {
+            operation: "file-read-data".to_string(),
+            target: Some("/tmp/secret.txt".to_string()),
+        }];
+        let denials = Vec::new();
+        let observation = nono::diagnostic::ErrorObservation::default();
+
+        assert!(should_print_diagnostic_footer(
+            false,
+            0,
+            &denials,
+            &violations,
+            &observation,
+        ));
+        assert!(!should_print_diagnostic_footer(
+            true,
+            0,
+            &denials,
+            &violations,
+            &observation,
+        ));
+    }
+
+    #[test]
+    fn test_profile_save_prompt_triggers_on_policy_explanation_with_zero_exit() {
+        let explanations = vec![nono::diagnostic::PolicyExplanation {
+            path: PathBuf::from("/tmp/secret.txt"),
+            access: nono::AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+            details: None,
+            policy_source: None,
+            suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
+        }];
+        let observation = nono::diagnostic::ErrorObservation::default();
+
+        assert!(should_offer_profile_save(
+            false,
+            0,
+            &explanations,
+            &observation,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
+        let explanations = Vec::new();
+        let observation = nono::diagnostic::ErrorObservation::default();
+        let violations = vec![nono::SandboxViolation {
+            operation: "user-preference-read".to_string(),
+            target: Some("kcfpreferencesanyapplication".to_string()),
+        }];
+
+        assert!(should_offer_profile_save(
+            false,
+            0,
+            &explanations,
+            &observation,
+            &violations,
+        ));
+    }
+
+    #[test]
+    fn test_keychain_mach_violation_adds_profile_save_explanation() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let temp_home = tempfile::TempDir::new().expect("temp home");
+        let home = temp_home.path().canonicalize().expect("canonical home");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("home path"))]);
+        let keychain = home.join("Library/Keychains/login.keychain-db");
+        std::fs::create_dir_all(keychain.parent().expect("keychain parent")).expect("mkdir");
+        std::fs::write(&keychain, b"db").expect("write keychain fixture");
+
+        let violations = vec![nono::SandboxViolation {
+            operation: "mach-lookup".to_string(),
+            target: Some("com.apple.SecurityServer".to_string()),
+        }];
+
+        let explanations = build_policy_explanations(&[], &violations, &nono::CapabilitySet::new());
+
+        let explanation = explanations
+            .iter()
+            .find(|explanation| explanation.path == keychain)
+            .expect("keychain explanation");
+        assert_eq!(explanation.access, nono::AccessMode::Read);
+        #[cfg(target_os = "macos")]
+        assert_eq!(explanation.reason, "sensitive_path");
+    }
+
+    #[test]
+    fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
+        let explanations = Vec::new();
+        let observation = nono::diagnostic::ErrorObservation::default();
+
+        assert!(should_offer_profile_save(
+            false,
+            1,
+            &explanations,
+            &observation,
+            &[],
+        ));
+        assert!(!should_offer_profile_save(
+            true,
+            1,
+            &explanations,
+            &observation,
+            &[],
+        ));
+    }
+
+    #[test]
     fn test_exec_strategy_variants() {
         assert_ne!(ExecStrategy::Direct, ExecStrategy::Supervised);
     }
@@ -3476,6 +3721,7 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3575,6 +3821,7 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 8080,
@@ -3650,6 +3897,7 @@ mod tests {
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3683,6 +3931,7 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3714,6 +3963,7 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3729,6 +3979,7 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3765,6 +4016,7 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3904,6 +4156,7 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: true,
             #[cfg(target_os = "linux")]
             proxy_port: 0,

@@ -3,7 +3,7 @@ title: Profile Authoring
 description: Scaffolding, schema validation, and tooling for creating custom profiles
 ---
 
-The `nono profile` command provides scaffolding and tooling for creating custom profiles. Instead of reverse-engineering the JSON structure from built-in profiles, you can generate skeleton files, get editor autocomplete via JSON Schema, and access an LLM-oriented authoring guide.
+The `nono profile` command provides scaffolding and tooling for creating custom profiles. Instead of reverse-engineering the JSON structure from existing profiles, you can generate skeleton files, get editor autocomplete via JSON Schema, and access an LLM-oriented authoring guide.
 
 <Tip>
   For an overview of what profiles are and how they compose with groups, see [Profiles & Groups](/cli/features/profiles-groups).
@@ -86,7 +86,8 @@ With `--full`, additional sections are included as empty stubs for all additive 
     "read_file": [],
     "write_file": [],
     "deny": [],
-    "bypass_protection": []
+    "bypass_protection": [],
+    "suppress_save_prompt": []
   },
   "security": {},
   "network": {
@@ -118,7 +119,7 @@ With `--full`, additional sections are included as empty stubs for all additive 
 The `init` command validates inputs before writing:
 
 - **Profile name** must be alphanumeric with hyphens (no leading/trailing hyphens)
-- **`--extends`** target must exist as a built-in or user profile
+- **`--extends`** target must exist as a preset, pack, or user profile
 - **`--groups`** are checked against the embedded policy groups
 
 After creating a profile, validate it:
@@ -293,6 +294,28 @@ Groups are referenced by name in the `groups.include` field. See [Profiles & Gro
 <Note>
   `filesystem.bypass_protection` only removes the deny rule. You must also grant access via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) for the path to be accessible.
 </Note>
+
+### Suppressing Repeated Save Suggestions
+
+Use `filesystem.suppress_save_prompt` for paths you intentionally do not want
+to grant, but also do not want to see in the save-profile prompt on every run:
+
+```json
+{
+  "filesystem": {
+    "suppress_save_prompt": ["$HOME/.copilot/settings.json"]
+  }
+}
+```
+
+This does not grant access and does not hide diagnostics. It only suppresses
+matching save-profile suggestions. `filesystem.ignore` is accepted as an alias,
+but the canonical name is deliberately explicit so it is not mistaken for
+allowing the denied path.
+
+The post-run save prompt offers the same behavior interactively: choose
+`suppress` to save all listed denied-path suggestions here instead of adding
+them as `read`, `read_file`, `allow`, or `allow_file` grants.
 
 ### Exclude Inherited Groups
 

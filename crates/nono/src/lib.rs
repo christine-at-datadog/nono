@@ -55,6 +55,7 @@ pub mod net_filter;
 pub mod path;
 pub mod query;
 pub mod sandbox;
+pub mod scrub;
 pub mod state;
 pub mod supervisor;
 pub mod trust;
@@ -81,6 +82,10 @@ pub use path::try_canonicalize;
 #[cfg(target_os = "linux")]
 pub use sandbox::{detect_abi, is_wsl2, DetectedAbi};
 pub use sandbox::{Sandbox, SupportInfo};
+pub use scrub::{
+    scrub_argv, scrub_argv_with_policy, scrub_header, scrub_header_with_policy, scrub_value,
+    scrub_value_with_policy, ScrubPolicy, ScrubPolicyDiff,
+};
 pub use state::SandboxState;
 pub use supervisor::{
     ApprovalBackend, ApprovalDecision, CapabilityRequest, SupervisorSocket, UrlOpenRequest,

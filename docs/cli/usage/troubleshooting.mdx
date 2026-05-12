@@ -3,8 +3,6 @@ title: Troubleshooting
 description: Common issues and solutions when using nono
 ---
 
-Common issues and solutions when using nono.
-
 ## Permission Denied Errors
 
 ### Symptom
@@ -320,28 +318,31 @@ uname -r
 
 ## Using `nono learn` to Discover Required Paths
 
-If you're getting permission errors and aren't sure which paths your application needs, use `nono learn` to trace file accesses:
+If you're getting permission errors and aren't sure which paths your application needs, use `nono learn` on Linux or run the command under the target profile on macOS:
 
 ```bash
-# Discover all paths accessed by your app
+# Linux: discover all paths accessed by your app
 nono learn -- my-app
 
-# Compare against an existing profile to see what's missing
+# Linux: compare against an existing profile to see what's missing
 nono learn --profile my-profile -- my-app
 
-# Output as JSON for easy profile creation
+# Linux: output as JSON for easy profile creation
 nono learn --json -- my-app
+
+# macOS: collect real Seatbelt denials and offer to save a profile patch
+nono run --profile my-profile -- my-app
 ```
 
 <Note>
-  `nono learn` is available on Linux (requires `strace`) and macOS (requires `sudo` for `fs_usage` and `nettop`). The command runs WITHOUT sandbox restrictions to accurately trace file and network accesses.
+  On Linux, `nono learn` requires `strace` and runs without sandbox restrictions. On macOS, prefer sandboxed `nono run`; legacy unsandboxed tracing is still available with `nono learn --trace` and requires `sudo` for `fs_usage` and `nettop`.
 </Note>
 
 ### Example Workflow
 
-1. Run learn mode to discover paths:
+1. Run the command to discover paths:
    ```bash
-   nono learn -- opencode
+   nono run --profile opencode -- opencode
    ```
 
 2. Review the output to see which paths are needed:

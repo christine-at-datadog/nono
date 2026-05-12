@@ -49,6 +49,8 @@ struct AuditAttestationPredicate<'a> {
     started: &'a str,
     ended: &'a Option<String>,
     command: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redaction_policy: Option<nono::ScrubPolicyDiff>,
     audit_log: AuditLogPredicate<'a>,
     signer: AuditSignerPredicate<'a>,
 }
@@ -97,6 +99,7 @@ pub(crate) fn write_audit_attestation(
     session_dir: &Path,
     metadata: &SessionMetadata,
     signer: &AuditSigner,
+    redaction_policy: &nono::ScrubPolicy,
 ) -> Result<AuditAttestationSummary> {
     let integrity = metadata
         .audit_integrity
@@ -106,12 +109,14 @@ pub(crate) fn write_audit_attestation(
             reason: "audit attestation requires audit integrity to be enabled".to_string(),
         })?;
 
+    let scrubbed_command = nono::scrub_argv_with_policy(&metadata.command, redaction_policy);
     let predicate = serde_json::to_value(AuditAttestationPredicate {
         version: 1,
         session_id: &metadata.session_id,
         started: &metadata.started,
         ended: &metadata.ended,
-        command: &metadata.command,
+        command: &scrubbed_command,
+        redaction_policy: redaction_policy.diff_from_secure_default().into_option(),
         audit_log: AuditLogPredicate {
             hash_algorithm: &integrity.hash_algorithm,
             event_count: integrity.event_count,
@@ -468,7 +473,13 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
         };
         let mut metadata = sample_metadata();
-        let summary = write_audit_attestation(dir.path(), &metadata, &signer).unwrap();
+        let summary = write_audit_attestation(
+            dir.path(),
+            &metadata,
+            &signer,
+            &nono::ScrubPolicy::secure_default(),
+        )
+        .unwrap();
         metadata.audit_attestation = Some(summary);
 
         let verified = verify_audit_attestation(dir.path(), &metadata, None).unwrap();
@@ -479,6 +490,83 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         assert!(verified.session_id_matches);
         assert_eq!(verified.expected_public_key_matches, None);
         assert!(verified.verification_error.is_none());
+    }
+
+    #[test]
+    fn audit_attestation_predicate_scrubs_command_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let public_key = trust::export_public_key(&key_pair).unwrap();
+        let signer = AuditSigner {
+            key_pair,
+            key_id,
+            public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
+        };
+        let mut metadata = sample_metadata();
+        metadata.command = vec![
+            "curl".to_string(),
+            "-H".to_string(),
+            "Authorization: Bearer real-token".to_string(),
+            "https://example.com/api?token=query-secret&format=json".to_string(),
+        ];
+
+        write_audit_attestation(
+            dir.path(),
+            &metadata,
+            &signer,
+            &nono::ScrubPolicy::secure_default(),
+        )
+        .unwrap();
+
+        let bundle_path = dir.path().join(AUDIT_ATTESTATION_BUNDLE_FILENAME);
+        let bundle = trust::load_bundle(&bundle_path).unwrap();
+        let statement = extract_statement(&bundle).unwrap();
+        let command_json = statement
+            .predicate
+            .get("command")
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap();
+
+        assert!(command_json.contains("[REDACTED]"));
+        assert!(!command_json.contains("real-token"));
+        assert!(!command_json.contains("query-secret"));
+    }
+
+    #[test]
+    fn audit_attestation_predicate_records_redaction_policy_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let public_key = trust::export_public_key(&key_pair).unwrap();
+        let signer = AuditSigner {
+            key_pair,
+            key_id,
+            public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
+        };
+        let mut metadata = sample_metadata();
+        metadata.command = vec![
+            "curl".to_string(),
+            "--private-token=private-secret".to_string(),
+            "https://example.com/callback?state=visible&token=hidden".to_string(),
+        ];
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        redactions.add_flag("--private-token");
+        redactions.remove_query_key("state");
+
+        write_audit_attestation(dir.path(), &metadata, &signer, &redactions).unwrap();
+
+        let bundle_path = dir.path().join(AUDIT_ATTESTATION_BUNDLE_FILENAME);
+        let bundle = trust::load_bundle(&bundle_path).unwrap();
+        let statement = extract_statement(&bundle).unwrap();
+        let predicate_json = serde_json::to_string(&statement.predicate).unwrap();
+
+        assert!(predicate_json.contains("--private-token=[REDACTED]"));
+        assert!(predicate_json.contains("state=visible"));
+        assert!(predicate_json.contains("\"added_flags\":[\"--private-token\"]"));
+        assert!(predicate_json.contains("\"removed_query_keys\":[\"state\"]"));
+        assert!(!predicate_json.contains("private-secret"));
+        assert!(!predicate_json.contains("token=hidden"));
     }
 
     #[test]
@@ -507,7 +595,13 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
         };
         let mut metadata = sample_metadata();
-        let summary = write_audit_attestation(dir.path(), &metadata, &signer).unwrap();
+        let summary = write_audit_attestation(
+            dir.path(),
+            &metadata,
+            &signer,
+            &nono::ScrubPolicy::secure_default(),
+        )
+        .unwrap();
         metadata.audit_attestation = Some(summary);
         metadata.session_id = "tampered-session".to_string();
 

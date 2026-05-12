@@ -66,10 +66,13 @@
       "deny": {
         "access": [
           "~/Library/Application Support/Google/Chrome",
+          "~/Library/Application Support/Chromium",
           "~/Library/Application Support/Firefox",
           "~/Library/Application Support/Microsoft Edge",
           "~/Library/Application Support/Arc",
-          "~/Library/Application Support/Brave Browser",
+          "~/Library/Application Support/BraveSoftware",
+          "~/Library/Application Support/Vivaldi",
+          "~/Library/Application Support/com.operasoftware.Opera",
           "~/Library/Safari"
         ]
       }
@@ -84,7 +87,9 @@
           "~/.config/chromium",
           "~/.mozilla/firefox",
           "~/.config/microsoft-edge",
-          "~/.config/BraveSoftware"
+          "~/.config/BraveSoftware",
+          "~/.config/vivaldi",
+          "~/.config/opera"
         ]
       }
     },
@@ -596,7 +601,7 @@
         "name": "default",
         "version": "1.0.0",
         "description": "Default conservative base profile",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": [
@@ -634,7 +639,7 @@
         "name": "linux-host-compat",
         "version": "1.0.0",
         "description": "Linux compatibility profile for host runtime, sysfs, and temp access",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": [
@@ -657,7 +662,7 @@
         "name": "openclaw",
         "version": "1.0.0",
         "description": "OpenClaw messaging gateway",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": ["node_runtime"]
@@ -685,7 +690,7 @@
         "name": "opencode",
         "version": "1.0.0",
         "description": "OpenCode AI coding assistant",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "linux_sysfs_read", "git_config", "unlink_protection"]
@@ -717,7 +722,7 @@
         "name": "python-dev",
         "version": "1.0.0",
         "description": "Python SDK development profile with pyenv, conda, and pip support",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": ["python_runtime"]
@@ -737,7 +742,7 @@
         "name": "node-dev",
         "version": "1.0.0",
         "description": "Node.js SDK development profile with nvm, fnm, pnpm, and npm support",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": ["node_runtime"]
@@ -756,7 +761,7 @@
         "name": "go-dev",
         "version": "1.0.0",
         "description": "Go SDK development profile with GOPATH and module support",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": ["go_runtime"]
@@ -775,7 +780,7 @@
         "name": "rust-dev",
         "version": "1.0.0",
         "description": "Rust SDK development profile with cargo and rustup support",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": ["rust_runtime"]
@@ -794,7 +799,7 @@
         "name": "swival",
         "version": "1.0.0",
         "description": "Swival CLI coding agent",
-        "author": "nono-project"
+        "author": "always-further"
       },
       "groups": {
         "include": [

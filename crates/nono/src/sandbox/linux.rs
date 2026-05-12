@@ -8,6 +8,7 @@ use landlock::{
     Ruleset, RulesetAttr, RulesetCreatedAttr, Scope, ABI,
 };
 use std::path::Path;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 /// Detected Landlock ABI version with feature query methods.
@@ -111,10 +112,25 @@ const ABI_PROBE_ORDER: [ABI; 6] = [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, 
 /// Probes from V6 down to V1 using `HardRequirement` compatibility mode.
 /// Returns the highest ABI for which a full ruleset can be created.
 ///
+/// The result is cached after the first call since the kernel ABI does not
+/// change at runtime.
+///
 /// # Errors
 ///
 /// Returns an error if no ABI version is supported (Landlock not available).
 pub fn detect_abi() -> Result<DetectedAbi> {
+    static CACHED: OnceLock<DetectedAbi> = OnceLock::new();
+
+    if let Some(abi) = CACHED.get() {
+        return Ok(*abi);
+    }
+
+    let abi = detect_abi_uncached()?;
+    let _ = CACHED.set(abi);
+    Ok(abi)
+}
+
+fn detect_abi_uncached() -> Result<DetectedAbi> {
     let mut last_error = None;
 
     for &abi in &ABI_PROBE_ORDER {
@@ -761,10 +777,10 @@ const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_uint = 1 << 3;
 const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_uint = 1 << 4;
 
 // ioctl request codes for seccomp notifications
-const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc0502100;
-const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc0182101;
-const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x40082102;
-const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x40182103;
+const SECCOMP_IOCTL_NOTIF_RECV: libc::Ioctl = 0xc0502100 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = 0xc0182101 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::Ioctl = 0x40082102 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_ADDFD: libc::Ioctl = 0x40182103 as libc::Ioctl;
 
 // Seccomp addfd flags
 const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;

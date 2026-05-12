@@ -14,6 +14,7 @@ mod cli_bootstrap;
 mod command_blocking_deprecation;
 mod command_display;
 mod command_runtime;
+mod completions;
 mod config;
 mod credential_runtime;
 mod deprecated_policy;
@@ -34,6 +35,7 @@ mod open_url_runtime;
 mod output;
 mod package;
 mod package_cmd;
+mod package_status;
 mod policy;
 mod profile;
 mod profile_cmd;
@@ -83,7 +85,6 @@ use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
 };
 use nono::Result;
-use tracing::error;
 
 const DETACHED_LAUNCH_ENV: &str = "NONO_DETACHED_LAUNCH";
 const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONSE";
@@ -108,6 +109,10 @@ fn main() {
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
     if let Err(e) = run_cli(cli) {
+        if let nono::NonoError::ActionRequired(message) = &e {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
         // User-initiated stops (declined prompt, non-TTY without
         // NONO_AUTO_MIGRATE) are surfaced as `NonoError::Cancelled`.
         // Their stderr message has already been printed at the call
@@ -117,7 +122,6 @@ fn main() {
         if matches!(e, nono::NonoError::Cancelled(_)) {
             std::process::exit(1);
         }
-        error!("{}", e);
         eprintln!("nono: {}", e);
         std::process::exit(1);
     }
@@ -248,7 +252,9 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
             allowed_env_vars: None,
+            denied_env_vars: None,
             mediation: mediation::MediationConfig::default(),
         };
 
@@ -292,7 +298,9 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
             allowed_env_vars: None,
+            denied_env_vars: None,
             mediation: mediation::MediationConfig::default(),
         };
 
@@ -383,6 +391,17 @@ mod tests {
 
         let wrap = Cli::parse_from(["nono", "wrap", "--allow", "/tmp", "--", "/bin/sh"]);
         assert!(!allows_pre_exec_update_check(&wrap.command));
+    }
+
+    #[test]
+    fn test_pre_exec_update_check_disabled_for_completions() {
+        // `nono completions` is used in shell init scripts such as
+        // `eval "$(nono completions zsh)"`.  It never shows an update
+        // notification (it is dispatched directly without
+        // run_command_with_update), so spawning the background update-check
+        // thread would incur network I/O with no benefit.
+        let completions = Cli::parse_from(["nono", "completion", "zsh"]);
+        assert!(!allows_pre_exec_update_check(&completions.command));
     }
 
     #[test]

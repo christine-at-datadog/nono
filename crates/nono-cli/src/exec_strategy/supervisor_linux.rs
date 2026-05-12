@@ -972,6 +972,8 @@ mod tests {
             proxy_port: u16,
             proxy_bind_ports: Vec<u16>,
         ) -> SupervisorConfig<'a> {
+            static REDACTION_POLICY: std::sync::LazyLock<nono::ScrubPolicy> =
+                std::sync::LazyLock::new(nono::ScrubPolicy::secure_default);
             SupervisorConfig {
                 protected_roots: &[],
                 approval_backend: backend,
@@ -981,6 +983,7 @@ mod tests {
                 open_url_origins: &[],
                 open_url_allow_localhost: false,
                 audit_recorder: None,
+                redaction_policy: &REDACTION_POLICY,
                 allow_launch_services_active: false,
                 proxy_port,
                 proxy_bind_ports,

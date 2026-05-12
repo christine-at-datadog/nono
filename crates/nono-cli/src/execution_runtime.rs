@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{error, info};
 
-const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
@@ -34,8 +34,6 @@ fn apply_pre_fork_sandbox(
         {
             Sandbox::apply(caps)?;
         }
-
-        output::print_sandbox_active(silent);
     }
     Ok(())
 }
@@ -139,6 +137,19 @@ fn should_apply_startup_timeout(
     recommended_profile.is_some() && cmd_args.is_empty()
 }
 
+fn startup_timeout_profile<'a>(
+    recommended_profile: Option<&'a str>,
+    explicit_profile: Option<&str>,
+) -> Option<&'a str> {
+    let recommended = recommended_profile?;
+    if let Some(explicit) = explicit_profile {
+        if explicit == recommended || explicit == format!("{recommended}-local") {
+            return None;
+        }
+    }
+    Some(recommended)
+}
+
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let LaunchPlan {
         program,
@@ -174,11 +185,14 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     let resolved_program = exec_strategy::resolve_program(&command[0])?;
+    let known_builtin_profile = recommended_builtin_profile(&resolved_program);
     let recommended_profile = if flags.session.profile_name.is_none() {
-        recommended_builtin_profile(&resolved_program)
+        known_builtin_profile
     } else {
         None
     };
+    let startup_timeout_profile =
+        startup_timeout_profile(known_builtin_profile, flags.session.profile_name.as_deref());
 
     let recommended_program_name = resolved_program
         .file_name()
@@ -188,7 +202,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     if let Some(profile) = recommended_profile {
         output::print_profile_hint(recommended_program_name, profile, flags.silent);
     }
-    let cap_file = write_capability_state_file(&caps, &flags.bypass_protection_paths, flags.silent);
+    let cap_file = write_capability_state_file(
+        &caps,
+        &flags.bypass_protection_paths,
+        &flags.proxy.allow_domain,
+        flags.silent,
+    );
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
 
     for secret in &loaded_secrets {
@@ -413,8 +432,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .profile_name
             .as_deref()
             .or(recommended_profile),
-        startup_timeout: if should_apply_startup_timeout(recommended_profile, &cmd_args) {
-            recommended_profile.map(|profile| exec_strategy::StartupTimeoutConfig {
+        ignored_denial_paths: &flags.ignored_denial_paths,
+        startup_timeout: if should_apply_startup_timeout(startup_timeout_profile, &cmd_args) {
+            startup_timeout_profile.map(|profile| exec_strategy::StartupTimeoutConfig {
                 timeout: PROFILE_HINT_STARTUP_TIMEOUT,
                 program: recommended_program_name,
                 profile,
@@ -426,6 +446,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
         allowed_env_vars: flags.allowed_env_vars,
+        denied_env_vars: flags.denied_env_vars,
         extra_blocked_env: &mediation_env_block,
     };
 
@@ -446,6 +467,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 proxy_handle: proxy_handle.as_ref(),
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),
+                redaction_policy: &flags.redaction_policy,
                 silent: flags.silent,
                 pre_session_id: Some(mediation_session_id),
                 pre_session_name: Some(mediation_session_name),
@@ -457,6 +479,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             cleanup_capability_state_file(&cap_file_path);
             drop(config);
             drop(loaded_secrets);
+            // `std::process::exit` does NOT run destructors, so we must drop
+            // the proxy handle explicitly to fire its `Drop` impl — that's
+            // what removes the TLS-intercept trust bundle and its parent
+            // session directory under `~/.nono/sessions/`. Without this
+            // every supervised-mode session leaks a file + directory.
+            drop(proxy_handle);
             std::process::exit(exit_code);
         }
     }
@@ -465,9 +493,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 fn write_capability_state_file(
     caps: &CapabilitySet,
     bypass_protection_paths: &[std::path::PathBuf],
+    allowed_domains: &[String],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
-    let state = sandbox_state::SandboxState::from_caps(caps, bypass_protection_paths);
+    let state =
+        sandbox_state::SandboxState::from_caps(caps, bypass_protection_paths, allowed_domains);
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();
@@ -512,6 +542,7 @@ fn write_capability_state_file(
 mod tests {
     use super::{
         compute_executable_identity, recommended_builtin_profile, should_apply_startup_timeout,
+        startup_timeout_profile,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -543,6 +574,27 @@ mod tests {
             &["--version"]
         ));
         assert!(!should_apply_startup_timeout(None, &no_args));
+    }
+
+    #[test]
+    fn startup_timeout_profile_ignores_matching_explicit_profile_only() {
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), None),
+            Some("claude-code")
+        );
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), Some("default")),
+            Some("claude-code")
+        );
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), Some("claude-code")),
+            None
+        );
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), Some("claude-code-local")),
+            None
+        );
+        assert_eq!(startup_timeout_profile(None, Some("default")), None);
     }
 
     #[test]

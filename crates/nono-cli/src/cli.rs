@@ -32,7 +32,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   wrap       Apply sandbox and exec into command (nono disappears)
 
 \x1b[1mEXPLORATION & DEBUGGING\x1b[0m
-  learn      Trace a command to discover required filesystem paths
+  learn      [deprecated] Use `nono run` to learn from sandbox denials
   why        Check why a path or network operation would be allowed or denied
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
@@ -57,6 +57,9 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
 \x1b[1mPOLICY & PROFILES\x1b[0m
   policy     [deprecated] Use 'nono profile' instead
   profile    Create, inspect, and compare nono profiles
+
+\x1b[1mSHELL\x1b[0m
+  completion   Generate shell completion scripts
 
 \x1b[1mOPTIONS\x1b[0m
 {options}
@@ -172,7 +175,8 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// Trace a command to discover required filesystem paths
+    /// [deprecated] Use `nono run` to learn from sandbox denials
+    /// DEPRECATED(canonical="nono run", introduced="v0.50.1", remove_by="v1.0.0", issue="#445")
     #[command(trailing_var_arg = true)]
     #[command(help_template = "\
 {about}
@@ -182,15 +186,20 @@ pub enum Commands {
 
 {all-args}
 {after-help}")]
-    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono learn -- my-app                         # Discover paths needed by a command
-  nono learn --profile my-profile -- my-app    # Compare against an existing profile
+    #[command(after_help = "\x1b[1mDEPRECATED\x1b[0m
+  Use `nono run --profile <name> -- <command>` instead. `nono run` keeps the
+  command sandboxed, reports denials, and offers to save profile updates.
+
+\x1b[1mEXAMPLES\x1b[0m
+  nono run --profile my-profile -- my-app      # Preferred learning workflow
+  nono learn --profile my-profile -- my-app    # Deprecated compatibility path
   nono learn --json -- node server.js          # Output as JSON for profile
   nono learn --timeout 30 -- my-app            # Limit trace duration
 
 \x1b[1mPLATFORM NOTES\x1b[0m
   Linux   Uses strace (install with: apt install strace)
-  macOS   Uses fs_usage (requires sudo)
+  macOS   Prefer: nono run --profile <name> -- <command>
+          Legacy unsandboxed fs_usage/nettop tracing: nono learn --trace -- <command>
 ")]
     Learn(Box<LearnArgs>),
 
@@ -493,7 +502,10 @@ IN-BAND DETACH:
   nono profile list                            # List all profiles (built-in and user)
   nono profile show claude-code                # Show a fully resolved profile
   nono profile diff default claude-code        # Compare two profiles
-  nono profile validate ~/my-profile.json      # Validate a user profile file
+  nono profile validate my-agent               # Validate a profile by name
+  nono profile validate ~/my-profile.json      # Validate a profile file
+  nono profile validate --draft my-profile     # Validate a profile draft
+  nono profile promote my-profile              # Review and apply a profile draft
   nono profile groups                          # List all policy groups
   nono profile groups deny_credentials         # Show details for a specific group
   nono profile schema                          # Print JSON Schema for editor validation
@@ -575,6 +587,24 @@ IN-BAND DETACH:
   nono list --installed --json
 ")]
     List(ListArgs),
+
+    /// Generate shell completion scripts
+    #[command(name = "completion")]
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono completion <shell>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono completion bash >> ~/.bashrc
+  nono completion zsh > ~/.zfunc/_nono
+  nono completion fish > ~/.config/fish/completions/nono.fish
+  nono completion powershell >> $PROFILE
+")]
+    Completions(CompletionsArgs),
 
     /// Internal: open a URL via supervisor IPC
     #[command(hide = true)]
@@ -705,6 +735,34 @@ pub struct OpenUrlHelperArgs {
     pub url: String,
 }
 
+/// Shell variant for completion generation.
+///
+/// Mirrors `clap_complete::Shell` but is defined here so it implements
+/// `clap::ValueEnum` and appears correctly in `--help` output.
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CompletionShell {
+    /// Bourne Again SHell (bash)
+    Bash,
+    /// Z Shell (zsh)
+    Zsh,
+    /// Friendly Interactive Shell (fish)
+    Fish,
+    /// PowerShell
+    #[value(name = "powershell")]
+    PowerShell,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for
+    pub shell: CompletionShell,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
 // NOTE: `PolicyArgs`, `PolicyCommands`, and `Policy*Args` types that
 // backed `nono policy <sub>` now live in `crate::deprecated_policy`. They
 // share their inner arg shapes with `ProfileGroupsArgs` / `ProfileListArgs`
@@ -734,6 +792,8 @@ pub enum ProfileCommands {
     Diff(ProfileDiffArgs),
     /// Validate a profile JSON file
     Validate(ProfileValidateArgs),
+    /// Review and apply a profile draft from ~/.config/nono/profile-drafts
+    Promote(ProfilePromoteArgs),
     /// List policy groups or show details for a specific group
     Groups(ProfileGroupsArgs),
     /// Output the JSON Schema for profile files
@@ -816,9 +876,13 @@ pub struct ProfileDiffArgs {
 }
 
 #[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
 pub struct ProfileValidateArgs {
     /// Profile JSON file to validate
     pub file: PathBuf,
+    /// Treat the argument as a draft name under ~/.config/nono/profile-drafts
+    #[arg(long)]
+    pub draft: bool,
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -829,6 +893,25 @@ pub struct ProfileValidateArgs {
     /// warnings passes as usual.
     #[arg(long)]
     pub strict: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct ProfilePromoteArgs {
+    /// Draft profile name
+    pub name: String,
+    /// Show the proposed diff without applying it
+    #[arg(long)]
+    pub diff: bool,
+    /// Apply without interactive confirmation
+    #[arg(long)]
+    pub yes: bool,
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 #[derive(Parser, Debug)]
@@ -910,6 +993,16 @@ pub struct SandboxArgs {
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
+
+    /// Suppress save-profile prompts for denials under this path. Does not grant access
+    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
+    #[arg(
+        long = "suppress-save-prompt",
+        alias = "ignore-denied",
+        value_name = "PATH",
+        help_heading = "FILESYSTEM"
+    )]
+    pub suppress_save_prompt: Vec<PathBuf>,
 
     /// Allow CWD access without prompting (level set by profile, defaults to read-only)
     #[arg(long, help_heading = "FILESYSTEM")]
@@ -1111,7 +1204,7 @@ pub struct SandboxArgs {
             "allow", "read", "write", "allow_file", "read_file", "write_file",
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
-            "profile", "bypass_protection", "allow_cwd",
+            "profile", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_net", "network_profile", "allow_proxy",
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
@@ -1207,6 +1300,16 @@ pub struct WrapSandboxArgs {
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
+
+    /// Suppress save-profile prompts for denials under this path. Does not grant access
+    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
+    #[arg(
+        long = "suppress-save-prompt",
+        alias = "ignore-denied",
+        value_name = "PATH",
+        help_heading = "FILESYSTEM"
+    )]
+    pub suppress_save_prompt: Vec<PathBuf>,
 
     /// Allow CWD access without prompting (level set by profile, defaults to read-only)
     #[arg(long, help_heading = "FILESYSTEM")]
@@ -1315,7 +1418,7 @@ pub struct WrapSandboxArgs {
             "allow", "read", "write", "allow_file", "read_file", "write_file",
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
-            "profile", "bypass_protection", "allow_cwd",
+            "profile", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_bind", "allow_port", "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
@@ -1347,6 +1450,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_unix_socket_dir: args.allow_unix_socket_dir,
             allow_unix_socket_dir_bind: args.allow_unix_socket_dir_bind,
             bypass_protection: args.bypass_protection,
+            suppress_save_prompt: args.suppress_save_prompt,
             allow_cwd: args.allow_cwd,
             workdir: args.workdir,
             block_net: args.block_net,
@@ -1639,6 +1743,10 @@ pub struct LearnArgs {
     /// Skip reverse DNS lookups for discovered IPs
     #[arg(long, help_heading = "OPTIONS")]
     pub no_rdns: bool,
+
+    /// On macOS, use legacy unsandboxed fs_usage/nettop tracing
+    #[arg(long, help_heading = "OPTIONS")]
+    pub trace: bool,
 
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
@@ -3102,6 +3210,57 @@ mod tests {
     }
 
     #[test]
+    fn test_suppress_save_prompt_multiple() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--suppress-save-prompt",
+            "/tmp/a",
+            "--suppress-save-prompt",
+            "/tmp/b",
+            "--allow",
+            ".",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sandbox.suppress_save_prompt.len(), 2);
+                assert_eq!(
+                    args.sandbox.suppress_save_prompt[0],
+                    PathBuf::from("/tmp/a")
+                );
+                assert_eq!(
+                    args.sandbox.suppress_save_prompt[1],
+                    PathBuf::from("/tmp/b")
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_ignore_denied_alias_maps_to_suppress_save_prompt() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--ignore-denied",
+            "/tmp/a",
+            "--allow",
+            ".",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.sandbox.suppress_save_prompt,
+                    vec![PathBuf::from("/tmp/a")]
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
     fn test_env_credential_map_repeatable_parses_pairs() {
         let cli = Cli::parse_from([
             "nono",
@@ -3364,9 +3523,30 @@ mod tests {
     /// All subcommand names that must appear in the root help template.
     /// If you add a new command to the `Commands` enum, add it here too.
     const ALL_SUBCOMMANDS: &[&str] = &[
-        "setup", "run", "shell", "wrap", "learn", "why", "ps", "stop", "detach", "attach", "logs",
-        "inspect", "session", "rollback", "audit", "trust", "policy", "profile", "pull", "remove",
-        "update", "search", "list",
+        "setup",
+        "run",
+        "shell",
+        "wrap",
+        "learn",
+        "why",
+        "ps",
+        "stop",
+        "detach",
+        "attach",
+        "logs",
+        "inspect",
+        "session",
+        "rollback",
+        "audit",
+        "trust",
+        "policy",
+        "profile",
+        "pull",
+        "remove",
+        "update",
+        "search",
+        "list",
+        "completion",
     ];
 
     #[test]

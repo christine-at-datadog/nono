@@ -31,6 +31,8 @@ pub struct UserConfig {
     pub updates: UpdateSettings,
     #[serde(default)]
     pub ui: UiSettings,
+    #[serde(default)]
+    pub redaction: RedactionSettings,
 }
 
 /// UI display settings
@@ -42,6 +44,60 @@ pub struct UiSettings {
     /// In-band PTY detach sequence, e.g. "ctrl-] d"
     #[serde(default)]
     pub detach_sequence: Option<DetachSequence>,
+}
+
+/// Output redaction settings for command context persisted in sessions and audit logs.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct RedactionSettings {
+    /// Additional command flags whose following value, or `--flag=value` value,
+    /// should be redacted.
+    #[serde(default)]
+    pub extra_flags: Vec<String>,
+    /// Additional HTTP header names whose value should be redacted.
+    #[serde(default)]
+    pub extra_headers: Vec<String>,
+    /// Additional URL query parameter names whose value should be redacted.
+    #[serde(default)]
+    pub extra_query_keys: Vec<String>,
+    /// Required before any secure default redaction names can be removed.
+    #[serde(default)]
+    pub unsafe_redaction_overrides: bool,
+    /// Secure default names to stop redacting for unsafe debugging sessions.
+    #[serde(default)]
+    pub allow_unredacted_defaults: Vec<String>,
+}
+
+impl RedactionSettings {
+    pub fn to_scrub_policy(&self) -> Result<nono::ScrubPolicy> {
+        if !self.unsafe_redaction_overrides && !self.allow_unredacted_defaults.is_empty() {
+            return Err(NonoError::ConfigParse(
+                "[redaction].allow_unredacted_defaults requires \
+                 unsafe_redaction_overrides = true"
+                    .to_string(),
+            ));
+        }
+
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        for flag in &self.extra_flags {
+            redactions.add_flag(flag);
+        }
+        for header in &self.extra_headers {
+            redactions.add_header(header);
+        }
+        for key in &self.extra_query_keys {
+            redactions.add_query_key(key);
+        }
+
+        if self.unsafe_redaction_overrides {
+            for name in &self.allow_unredacted_defaults {
+                redactions.remove_flag(name);
+                redactions.remove_header(name);
+                redactions.remove_query_key(name);
+            }
+        }
+
+        Ok(redactions)
+    }
 }
 
 /// Parsed in-band PTY detach sequence.
@@ -358,6 +414,60 @@ alice = { name = "Alice", fingerprint = "abc123" }
         assert!(config.overrides.sensitive_paths.is_empty());
         assert!(config.overrides.commands.is_empty());
         assert!(config.ui.detach_sequence.is_none());
+        assert!(config.redaction.extra_flags.is_empty());
+    }
+
+    #[test]
+    fn test_redaction_settings_add_extra_patterns() {
+        let toml = r#"
+[redaction]
+extra_flags = ["--private-token"]
+extra_headers = ["Private-Token"]
+extra_query_keys = ["signature"]
+"#;
+        let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
+        let policy = config
+            .redaction
+            .to_scrub_policy()
+            .expect("Failed to build policy");
+
+        let diff = policy.diff_from_secure_default();
+        assert_eq!(diff.added_flags, vec!["--private-token".to_string()]);
+        assert_eq!(diff.added_headers, vec!["private-token".to_string()]);
+        assert_eq!(diff.added_query_keys, vec!["signature".to_string()]);
+    }
+
+    #[test]
+    fn test_redaction_settings_require_unsafe_override_for_removals() {
+        let toml = r#"
+[redaction]
+allow_unredacted_defaults = ["state"]
+"#;
+        let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
+        let err = config
+            .redaction
+            .to_scrub_policy()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("unsafe_redaction_overrides = true"));
+    }
+
+    #[test]
+    fn test_redaction_settings_can_remove_defaults_when_unsafe_enabled() {
+        let toml = r#"
+[redaction]
+unsafe_redaction_overrides = true
+allow_unredacted_defaults = ["state"]
+"#;
+        let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
+        let policy = config
+            .redaction
+            .to_scrub_policy()
+            .expect("Failed to build policy");
+
+        let diff = policy.diff_from_secure_default();
+        assert_eq!(diff.removed_query_keys, vec!["state".to_string()]);
     }
 
     #[test]

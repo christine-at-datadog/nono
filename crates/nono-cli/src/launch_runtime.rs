@@ -96,11 +96,14 @@ pub(crate) struct ExecutionFlags {
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) session: SessionLaunchOptions,
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
     pub(crate) proxy: ProxyLaunchOptions,
+    pub(crate) redaction_policy: nono::ScrubPolicy,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    pub(crate) denied_env_vars: Option<Vec<String>>,
     pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
@@ -116,6 +119,7 @@ impl ExecutionFlags {
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
             session: SessionLaunchOptions::default(),
             rollback: RollbackLaunchOptions::default(),
             trust: TrustLaunchOptions {
@@ -124,7 +128,9 @@ impl ExecutionFlags {
                 ..TrustLaunchOptions::default()
             },
             proxy: ProxyLaunchOptions::default(),
+            redaction_policy: nono::ScrubPolicy::secure_default(),
             allowed_env_vars: None,
+            denied_env_vars: None,
             mediation: crate::mediation::MediationConfig::default(),
         })
     }
@@ -137,6 +143,7 @@ pub(crate) fn prepare_run_launch_plan(
     silent: bool,
 ) -> Result<LaunchPlan> {
     let detach_sequence = load_configured_detach_sequence()?;
+    let redaction_policy = load_configured_redaction_policy()?;
     let args = run_args.sandbox;
     let no_diagnostics = run_args.no_diagnostics;
     let rollback = run_args.rollback;
@@ -233,6 +240,7 @@ pub(crate) fn prepare_run_launch_plan(
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
             bypass_protection_paths: prepared.bypass_protection_paths,
+            ignored_denial_paths: prepared.ignored_denial_paths,
             session: SessionLaunchOptions {
                 detached_start: run_args.detached,
                 session_name: run_args.name,
@@ -252,7 +260,9 @@ pub(crate) fn prepare_run_launch_plan(
             },
             trust,
             proxy,
+            redaction_policy,
             allowed_env_vars: prepared.allowed_env_vars,
+            denied_env_vars: prepared.denied_env_vars,
             mediation: prepared.mediation,
         },
     })
@@ -262,6 +272,13 @@ pub(crate) fn load_configured_detach_sequence() -> Result<Option<Vec<u8>>> {
     Ok(config::user::load_user_config()?
         .and_then(|user_config| user_config.ui.detach_sequence)
         .map(|sequence| sequence.bytes().to_vec()))
+}
+
+pub(crate) fn load_configured_redaction_policy() -> Result<nono::ScrubPolicy> {
+    config::user::load_user_config()?.map_or_else(
+        || Ok(nono::ScrubPolicy::secure_default()),
+        |user_config| user_config.redaction.to_scrub_policy(),
+    )
 }
 
 fn prepare_trust_launch_options(

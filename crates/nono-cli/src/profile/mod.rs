@@ -89,6 +89,13 @@ pub struct FilesystemConfig {
     /// the new name makes the "does not grant access" semantics explicit.
     #[serde(default)]
     pub bypass_protection: Vec<String>,
+    /// Paths whose runtime denials should not be offered in the save-profile
+    /// prompt. This does not grant access, remove deny rules, or hide the
+    /// diagnostic footer; it only suppresses repeated save suggestions for
+    /// paths the user has decided not to grant.
+    /// ALIAS(canonical="suppress_save_prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
+    #[serde(default, alias = "ignore")]
+    pub suppress_save_prompt: Vec<String>,
 }
 
 /// Group composition — include/exclude pair for policy groups.
@@ -276,6 +283,7 @@ fn is_http_token_char(c: char) -> bool {
 /// - A 1Password `op://` URI (validated by `nono::keystore::validate_op_uri`)
 /// - An Apple Passwords `apple-password://` URI
 /// - A `file://` URI pointing to an absolute path (validated by `nono::keystore::validate_file_uri`)
+/// - An `env://` URI referencing a host environment variable (validated by `nono::keystore::validate_env_uri`)
 fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(NonoError::ProfileParse(format!(
@@ -306,12 +314,19 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
                 context_name, e
             ))
         })
+    } else if nono::keystore::is_env_uri(key) {
+        nono::keystore::validate_env_uri(key).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid env:// URI for custom credential '{}': {}",
+                context_name, e
+            ))
+        })
     } else {
         // Validate as keyring account name (alphanumeric + underscore)
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
-                 alphanumeric characters and underscores (or use op:// / apple-password:// / file:// URI)",
+                 alphanumeric characters and underscores (or use op:// / apple-password:// / file:// / env:// URI)",
                 key, context_name
             )));
         }
@@ -323,7 +338,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///
 /// Checks:
 /// - `credential_key` must be alphanumeric + underscores only, or a valid
-///   `op://` / `apple-password://` / `file://` URI
+///   `op://` / `apple-password://` / `file://` / `env://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
 ///   - `header`: inject_header must be valid HTTP token, credential_format no CRLF
@@ -357,9 +372,9 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     if let Some(ref key) = cred.credential_key {
         validate_credential_key(name, key)?;
 
-        // When credential_key is a URI manager reference, env_var is required because the URI
-        // cannot be meaningfully uppercased into an env var name (e.g.,
-        // "op://vault/item/field" -> "OP://VAULT/ITEM/FIELD" is nonsensical).
+        // URI manager references (except env://) cannot be meaningfully
+        // uppercased into an env var name, so env_var is required for them.
+        // env:// is exempt: the var name is derived from the URI itself.
         if (nono::keystore::is_op_uri(key)
             || nono::keystore::is_apple_password_uri(key)
             || nono::keystore::is_file_uri(key))
@@ -1162,6 +1177,11 @@ pub struct RollbackConfig {
 /// When `allow_vars` is set, only the listed variables (and nono-injected
 /// credentials) are passed through. Supports exact names (`"PATH"`) and
 /// prefix patterns (`"AWS_*"`).
+///
+/// Precedence (highest to lowest):
+/// 1. Hardcoded `is_dangerous_env_var` — always stripped, cannot be re-allowed.
+/// 2. `deny_vars` — stripped even if matched by `allow_vars`.
+/// 3. `allow_vars` — if non-empty, only matching vars pass; if empty, all (except 1+2) pass.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
@@ -1173,6 +1193,15 @@ pub struct EnvironmentConfig {
     /// Nono-injected credentials always bypass this list.
     #[serde(default)]
     pub allow_vars: Vec<String>,
+
+    /// Deny-list of environment variable names stripped from the sandboxed process.
+    ///
+    /// Supports exact names (`"GH_TOKEN"`) and prefix patterns ending with `*`
+    /// (`"GITHUB_*"` strips all vars starting with `GITHUB_`).
+    /// Denied vars are stripped even if they also appear in `allow_vars`.
+    /// Use this to strip specific secrets while keeping everything else inherited.
+    #[serde(default)]
+    pub deny_vars: Vec<String>,
 }
 
 /// Configuration for supervisor-delegated URL opening.
@@ -1854,7 +1883,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
 
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 pub(crate) fn resolve_and_finalize_profile(profile: Profile) -> Result<Profile> {
-    finalize_profile(resolve_extends(profile, &mut Vec::new(), 0, None)?)
+    finalize_profile(resolve_extends(profile, &mut Vec::new(), 0, None, None)?)
 }
 
 /// Get the implicit default groups for a finalized profile.
@@ -1908,13 +1937,16 @@ fn merge_implicit_default_groups(profile: &mut Profile) -> Result<()> {
 /// Used during inheritance resolution to load base profiles without
 /// triggering infinite recursion.
 fn parse_profile_file(path: &Path) -> Result<Profile> {
-    let content = fs::read_to_string(path).map_err(|e| NonoError::ProfileRead {
+    let content = fs::read(path).map_err(|e| NonoError::ProfileRead {
         path: path.to_path_buf(),
         source: e,
     })?;
+    parse_profile_bytes(&content)
+}
 
+pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     let profile: Profile =
-        serde_json::from_str(&content).map_err(|e| NonoError::ProfileParse(e.to_string()))?;
+        serde_json::from_slice(content).map_err(|e| NonoError::ProfileParse(e.to_string()))?;
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
@@ -1930,7 +1962,7 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
 fn load_from_file(path: &Path) -> Result<Profile> {
     let profile = parse_profile_file(path)?;
     let context_dir = path.parent();
-    resolve_extends(profile, &mut Vec::new(), 0, context_dir)
+    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(path))
 }
 
 // ============================================================================
@@ -1946,8 +1978,11 @@ const MAX_INHERITANCE_DEPTH: usize = 10;
 /// loaded and resolved recursively, then they are fold-merged left-to-right.
 /// The accumulated base is finally merged with the child. When `context_dir`
 /// is set, sibling `<name>.json` files are checked first so project-local
-/// profiles can reference each other by name. The `visited` vec tracks
-/// profile names already in the chain to detect circular dependencies.
+/// profiles can reference each other by name. `source_file` is the path of
+/// the file whose extends are being resolved so sibling lookup can skip
+/// self-references (e.g. `.nono/codex.json` extending `"codex"` should not
+/// resolve to itself). The `visited` vec tracks profile names already in the
+/// chain to detect circular dependencies.
 ///
 /// Shared transitive bases are handled naturally: `visited` tracks only the
 /// current ancestor chain (push before recurse, pop after). When two siblings
@@ -1959,6 +1994,7 @@ fn resolve_extends(
     visited: &mut Vec<String>,
     depth: usize,
     context_dir: Option<&Path>,
+    source_file: Option<&Path>,
 ) -> Result<Profile> {
     let base_names = match child.extends {
         Some(ref names) => names.clone(),
@@ -1986,12 +2022,18 @@ fn resolve_extends(
 
         visited.push(base_name.clone());
 
-        let resolved = load_base_profile_raw(base_name, context_dir)?;
-        let (base, next_context) = match resolved {
-            ResolvedBase::Sibling(p) => (p, context_dir),
-            ResolvedBase::Global(p) => (p, None),
+        let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
+        let (base, next_context, next_source) = match resolved {
+            ResolvedBase::Sibling(p, path) => (p, context_dir, Some(path)),
+            ResolvedBase::Global(p) => (p, None, None),
         };
-        let resolved_base = resolve_extends(base, visited, depth + 1, next_context)?;
+        let resolved_base = resolve_extends(
+            base,
+            visited,
+            depth + 1,
+            next_context,
+            next_source.as_deref(),
+        )?;
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
         visited.pop();
@@ -2011,9 +2053,10 @@ fn resolve_extends(
 /// Distinguishes where a base profile was resolved from so `resolve_extends`
 /// can propagate `context_dir` only for sibling-resolved profiles. Global
 /// sources (user dir, pack-store, built-in) clear the context to prevent
-/// project-local files from hijacking built-in inheritance chains.
+/// project-local files from hijacking built-in inheritance chains. `Sibling`
+/// carries the file path so the next recursion level can skip self-references.
 enum ResolvedBase {
-    Sibling(Profile),
+    Sibling(Profile, PathBuf),
     Global(Profile),
 }
 
@@ -2036,7 +2079,11 @@ enum ResolvedBase {
 /// instead of an inscrutable "base profile not found" error, the user
 /// sees the same install prompt that `--profile claude-code` would
 /// produce, with the chain still resolving cleanly on accept.
-fn load_base_profile_raw(name: &str, context_dir: Option<&Path>) -> Result<ResolvedBase> {
+fn load_base_profile_raw(
+    name: &str,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+) -> Result<ResolvedBase> {
     if !is_valid_profile_name(name) {
         return Err(NonoError::ProfileInheritance(format!(
             "invalid base profile name '{}'",
@@ -2045,15 +2092,21 @@ fn load_base_profile_raw(name: &str, context_dir: Option<&Path>) -> Result<Resol
     }
 
     // 0. Sibling in the same directory as the child profile.
+    //    Skip if the sibling path is the source file itself to avoid
+    //    self-references (e.g. `.nono/codex.json` extending "codex").
     if let Some(dir) = context_dir {
         let sibling_path = dir.join(format!("{name}.json"));
-        if sibling_path.is_file() {
+        let is_self = source_file.is_some_and(|src| sibling_path == src);
+        if !is_self && sibling_path.is_file() {
             tracing::debug!(
                 "Resolved '{}' from sibling: {}",
                 name,
                 sibling_path.display()
             );
-            return Ok(ResolvedBase::Sibling(parse_profile_file(&sibling_path)?));
+            return Ok(ResolvedBase::Sibling(
+                parse_profile_file(&sibling_path)?,
+                sibling_path,
+            ));
         }
     }
 
@@ -2168,6 +2221,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.filesystem.bypass_protection,
                 &child.filesystem.bypass_protection,
             ),
+            suppress_save_prompt: dedup_append(
+                &base.filesystem.suppress_save_prompt,
+                &child.filesystem.suppress_save_prompt,
+            ),
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
@@ -2221,6 +2278,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             (None, Some(child_env)) => Some(child_env.clone()),
             (Some(base_env), Some(child_env)) => Some(EnvironmentConfig {
                 allow_vars: dedup_append(&base_env.allow_vars, &child_env.allow_vars),
+                deny_vars: dedup_append(&base_env.deny_vars, &child_env.deny_vars),
             }),
         },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
@@ -2283,12 +2341,25 @@ pub(crate) fn dedup_append<T: Eq + std::hash::Hash + Clone>(base: &[T], child: &
 
 /// Get the path to a user profile
 pub(crate) fn get_user_profile_path(name: &str) -> Result<PathBuf> {
-    let config_dir = resolve_user_config_dir()?;
+    Ok(user_profile_dir()?.join(format!("{}.json", name)))
+}
 
-    Ok(config_dir
+pub(crate) fn user_profile_dir() -> Result<PathBuf> {
+    Ok(resolve_user_config_dir()?.join("nono").join("profiles"))
+}
+
+pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
+    Ok(resolve_user_config_dir()?
         .join("nono")
-        .join("profiles")
-        .join(format!("{}.json", name)))
+        .join("profile-drafts"))
+}
+
+pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
+    Ok(user_profile_draft_dir()?.join(format!("{}.json", name)))
+}
+
+pub(crate) fn get_user_profile_draft_base_path(name: &str) -> Result<PathBuf> {
+    Ok(user_profile_draft_dir()?.join(format!("{}.base", name)))
 }
 
 /// Resolve the user config directory with secure validation.
@@ -2724,12 +2795,32 @@ mod tests {
             "meta": {"name": "t"},
             "filesystem": {
                 "deny": ["/blocked"],
-                "bypass_protection": ["$HOME/.docker"]
+                "bypass_protection": ["$HOME/.docker"],
+                "suppress_save_prompt": ["$HOME/.copilot/settings.json"]
             }
         }"#;
         let profile: Profile = serde_json::from_str(json).expect("parse");
         assert_eq!(profile.filesystem.deny, vec!["/blocked"]);
         assert_eq!(profile.filesystem.bypass_protection, vec!["$HOME/.docker"]);
+        assert_eq!(
+            profile.filesystem.suppress_save_prompt,
+            vec!["$HOME/.copilot/settings.json"]
+        );
+    }
+
+    #[test]
+    fn test_filesystem_config_ignore_alias_drains_to_suppress_save_prompt() {
+        let json = r#"{
+            "meta": {"name": "t"},
+            "filesystem": {
+                "ignore": ["$HOME/.copilot/settings.json"]
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            profile.filesystem.suppress_save_prompt,
+            vec!["$HOME/.copilot/settings.json"]
+        );
     }
 
     #[test]
@@ -3115,6 +3206,93 @@ mod tests {
             .as_ref()
             .expect("environment should be Some");
         assert!(env_config.allow_vars.is_empty());
+    }
+
+    #[test]
+    fn test_environment_config_with_deny_vars() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "deny_vars": ["GH_TOKEN", "GITHUB_*", "ANTHROPIC_API_KEY"]
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let env_config = profile
+            .environment
+            .as_ref()
+            .expect("environment should be Some");
+        assert_eq!(
+            env_config.deny_vars,
+            vec!["GH_TOKEN", "GITHUB_*", "ANTHROPIC_API_KEY"]
+        );
+        assert!(env_config.allow_vars.is_empty());
+    }
+
+    #[test]
+    fn test_environment_config_allow_and_deny_vars_together() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "allow_vars": ["PATH", "HOME", "AWS_*"],
+                "deny_vars": ["AWS_SECRET_ACCESS_KEY"]
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let env_config = profile
+            .environment
+            .as_ref()
+            .expect("environment should be Some");
+        assert_eq!(env_config.allow_vars, vec!["PATH", "HOME", "AWS_*"]);
+        assert_eq!(env_config.deny_vars, vec!["AWS_SECRET_ACCESS_KEY"]);
+    }
+
+    #[test]
+    fn test_environment_config_deny_vars_merge() {
+        // Merging two profiles with deny_vars concatenates them
+        let base = Profile {
+            environment: Some(EnvironmentConfig {
+                allow_vars: vec![],
+                deny_vars: vec!["GH_TOKEN".into()],
+            }),
+            ..Default::default()
+        };
+        let child = Profile {
+            environment: Some(EnvironmentConfig {
+                allow_vars: vec![],
+                deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+            }),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child);
+        let env_config = merged
+            .environment
+            .expect("merged environment should be Some");
+        assert_eq!(env_config.deny_vars, vec!["GH_TOKEN", "ANTHROPIC_API_KEY"]);
+    }
+
+    #[test]
+    fn test_environment_config_deny_vars_merge_deduplicates() {
+        let base = Profile {
+            environment: Some(EnvironmentConfig {
+                allow_vars: vec![],
+                deny_vars: vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+            }),
+            ..Default::default()
+        };
+        let child = Profile {
+            environment: Some(EnvironmentConfig {
+                allow_vars: vec![],
+                deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+            }),
+            ..Default::default()
+        };
+        let merged = merge_profiles(base, child);
+        let env_config = merged
+            .environment
+            .expect("merged environment should be Some");
+        assert_eq!(env_config.deny_vars, vec!["GH_TOKEN", "ANTHROPIC_API_KEY"]);
     }
 
     #[test]
@@ -4131,6 +4309,7 @@ mod tests {
                 unix_socket_dir_bind: vec![],
                 deny: vec!["/base/policy-deny".to_string()],
                 bypass_protection: vec!["/base/override-deny".to_string()],
+                suppress_save_prompt: vec!["/base/no-prompt".to_string()],
             },
             network: NetworkConfig {
                 block: false,
@@ -4206,6 +4385,7 @@ mod tests {
                 unix_socket_dir_bind: vec![],
                 deny: vec!["/child/policy-deny".to_string()],
                 bypass_protection: vec!["/child/override-deny".to_string()],
+                suppress_save_prompt: vec!["/child/no-prompt".to_string()],
             },
             network: NetworkConfig {
                 block: false,
@@ -4634,7 +4814,8 @@ mod tests {
         };
 
         // Resolve B first
-        let resolved_b = resolve_extends(b_profile, &mut Vec::new(), 0, None).expect("resolve b");
+        let resolved_b =
+            resolve_extends(b_profile, &mut Vec::new(), 0, None, None).expect("resolve b");
         // Then merge A on top
         let merged = merge_profiles(resolved_b, a_profile);
 
@@ -4650,7 +4831,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0, None);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
         assert!(result.is_err());
         let err = result.expect_err("missing base should error");
         assert!(
@@ -4669,7 +4850,7 @@ mod tests {
         };
 
         let mut visited = vec!["a".to_string(), "b".to_string()];
-        let result = resolve_extends(profile, &mut visited, 2, None);
+        let result = resolve_extends(profile, &mut visited, 2, None, None);
         assert!(result.is_err());
         let err = result.expect_err("circular dep should error");
         assert!(
@@ -4687,7 +4868,7 @@ mod tests {
         };
 
         let mut visited = vec!["self-ref".to_string()];
-        let result = resolve_extends(profile, &mut visited, 1, None);
+        let result = resolve_extends(profile, &mut visited, 1, None, None);
         assert!(result.is_err());
         let err = result.expect_err("self-reference should error");
         assert!(
@@ -4707,7 +4888,13 @@ mod tests {
         let visited: Vec<String> = (0..MAX_INHERITANCE_DEPTH)
             .map(|i| format!("level-{}", i))
             .collect();
-        let result = resolve_extends(profile, &mut visited.clone(), MAX_INHERITANCE_DEPTH, None);
+        let result = resolve_extends(
+            profile,
+            &mut visited.clone(),
+            MAX_INHERITANCE_DEPTH,
+            None,
+            None,
+        );
         assert!(result.is_err());
         let err = result.expect_err("depth limit should error");
         assert!(
@@ -4953,6 +5140,14 @@ mod tests {
             .filesystem
             .bypass_protection
             .contains(&"/child/override-deny".to_string()));
+        assert!(merged
+            .filesystem
+            .suppress_save_prompt
+            .contains(&"/base/no-prompt".to_string()));
+        assert!(merged
+            .filesystem
+            .suppress_save_prompt
+            .contains(&"/child/no-prompt".to_string()));
     }
 
     #[test]
@@ -5065,7 +5260,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0, None);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
         assert!(result.is_err());
         let err = result.expect_err("empty string base should error");
         assert!(
@@ -5194,7 +5389,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0, None);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
         assert!(
             result.is_ok(),
             "duplicate base should be deduplicated, not error: {:?}",
@@ -5271,6 +5466,53 @@ mod tests {
             .filesystem
             .allow
             .contains(&"/tmp/shared".to_string()));
+    }
+
+    #[test]
+    fn test_extends_same_name_as_base_skips_self() {
+        // A file named "default.json" extending "default" should resolve to
+        // the built-in default profile, not itself (which would be circular).
+        let dir = tempdir().expect("tmpdir");
+        let self_path = dir.path().join("default.json");
+        std::fs::write(
+            &self_path,
+            r#"{ "extends": "default", "meta": { "name": "my-default" }, "filesystem": { "read": ["/tmp/mine"] } }"#,
+        )
+        .expect("write");
+
+        let profile = load_from_file(&self_path).expect("should not be circular");
+        assert_eq!(profile.meta.name, "my-default");
+        assert!(
+            !profile.groups.include.is_empty(),
+            "should inherit default groups"
+        );
+        assert!(profile.filesystem.read.contains(&"/tmp/mine".to_string()));
+    }
+
+    #[test]
+    fn test_extends_same_name_still_resolves_other_siblings() {
+        // "default.json" extends ["default", "extra"]. "default" should skip
+        // self and resolve globally; "extra" should resolve as a sibling.
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("extra.json"),
+            r#"{ "meta": { "name": "extra" }, "filesystem": { "allow": ["/tmp/extra"] } }"#,
+        )
+        .expect("write");
+        let self_path = dir.path().join("default.json");
+        std::fs::write(
+            &self_path,
+            r#"{ "extends": ["default", "extra"], "meta": { "name": "my-combo" } }"#,
+        )
+        .expect("write");
+
+        let profile = load_from_file(&self_path).expect("should resolve both bases");
+        assert_eq!(profile.meta.name, "my-combo");
+        assert!(
+            !profile.groups.include.is_empty(),
+            "should inherit default groups"
+        );
+        assert!(profile.filesystem.allow.contains(&"/tmp/extra".to_string()));
     }
 
     #[test]
@@ -5660,7 +5902,8 @@ mod tests {
                 "allow": ["/tmp/project"],
                 "read": ["/etc", "/opt/data"],
                 "allow_file": ["/tmp/config.json"],
-                "bypass_protection": ["/etc/hosts"]
+                "bypass_protection": ["/etc/hosts"],
+                "suppress_save_prompt": ["/tmp/project/.cache/noisy.json"]
             },
             "network": {
                 "block": false,
@@ -5847,8 +6090,53 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_custom_credential_env_uri_accepted() {
+        let cred = CustomCredentialDef {
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://MY_API_TOKEN".to_string()),
+            auth: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            endpoint_rules: vec![],
+            env_var: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+        };
+        assert!(validate_custom_credential("example", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_env_uri_dangerous_var_rejected() {
+        let cred = CustomCredentialDef {
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://LD_PRELOAD".to_string()),
+            auth: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            endpoint_rules: vec![],
+            env_var: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+        };
+        let result = validate_custom_credential("example", &cred);
+        assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
+    }
+
+    // End-to-end: parse a profile JSON with a file:// custom credential
+    #[test]
     fn test_profile_json_with_file_uri_custom_credential_parses() {
-        // End-to-end: parse a profile JSON with a file:// custom credential
         let dir = tempdir().expect("tmpdir");
         let profile_path = dir.path().join("file-cred.json");
         std::fs::write(

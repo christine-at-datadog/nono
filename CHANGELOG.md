@@ -2,15 +2,243 @@
 
 ## [Unreleased]
 
-<<<<<<< kipz/fix-mediation-socket-with-allow-domain
 ### Bug Fixes
 
 - *(sandbox/macos)* Mediation sockets now reachable when `network.allow_domain` is set. Seatbelt classifies AF_UNIX `connect(2)` as `network-outbound`; under `NetworkMode::ProxyOnly` the base `(deny network*)` blocked the audit/mediation shim's connect to `<session_dir>/{mediation,control,audit}.sock`. Adds a directory-scoped `UnixSocketCapability` for the session dir alongside the existing `FsCapability`. Fixes #33.
-=======
+
 ### Features
 
 - *(profile)* Mediation now merges across `extends` chains (per-field, with restrictive-wins on `caller_policy.agent_allowed`, `caller_policy.allowed_parents`, and `command_sandbox.network.block`/`keychain_access`). Previously a child profile that declared any `mediation` block fully replaced the base — silently dropping every mediated command the base set up.
->>>>>>> develop
+
+## [0.53.0] - 2026-05-11
+
+### Bug Fixes
+
+- Absolute match / 2 matches = deny / no match = passthrough w no creds
+
+- Review comments
+
+- Return full failure diagnostic
+
+- *(sandbox)* Cache Landlock ABI detection with OnceLock
+
+
+### Features
+
+- Fix upstream TLS trust, intercept auth, and multi-route dispatch.
+
+- *(core)* Scrub command arguments for secrets
+
+
+### Refactoring
+
+- *(scrub)* Optimize and simplify scrubbing logic
+
+## [0.52.2] - 2026-05-11
+
+### Bug Fixes
+
+- *(profile-save)* Address suppression review feedback
+
+
+### Features
+
+- *(profile-save)* Suppress save-profile prompts for denied paths
+
+
+### Miscellaneous
+
+- Release v0.52.1
+
+## [0.52.1] - 2026-05-11
+
+### Bug Fixes
+
+- *(profile-save)* Address suppression review feedback
+
+
+### Features
+
+- *(profile-save)* Suppress save-profile prompts for denied paths
+
+## [0.52.1] - 2026-05-11
+
+### Bug Fixes
+
+- Match backend validation logic
+
+- *(schema)* Add missing 'environment' property to profile JSON schema
+
+- *(proxy)* Set NODE_USE_ENV_PROXY for Node 26
+
+- *(policy)* Expand browser deny groups with missing Chromium-based browsers
+
+- Preserve two keyboard-mode resets
+
+- Documented concat! blocks instead of opaque byte blobs
+
+- *(pty)* Stop clearing terminal scrollback on exit for normal-mode sessions
+
+- Provide more accurate warning message + doc comment update
+
+- *(cli)* Validate --allow paths and persist domain allowlist in sandbox state
+
+- *(cli)* Make 'nono why --host' aware of proxy domain filtering
+
+- Prevent feature unification from linking libdbus in no-keyring builds
+
+
+### Documentation
+
+- *(agents)* Relax agent disclosure and expand campaign ban
+
+## [0.52.0] - 2026-05-10
+
+### Bug Fixes
+
+- *(diagnostic)* Parse escaped quotes in structured properties
+
+- *(env)* Preserve fail-closed semantics for empty allow_vars
+
+- *(lint)* Replace unwrap() with is_some_and() in test
+
+
+### Documentation
+
+- *(environment)* Document empty allow_vars array behavior
+
+- Restructure navigation and fix stale terminology
+
+
+### Features
+
+- *(cli)* Deprecate 'nono learn' and improve diagnostics
+
+- *(cli)* Enhance interactive experience and profile saving
+
+- *(cli)* Enhance macos learn and run diagnostics
+
+- *(env)* Add operator-controlled deny_vars to EnvironmentConfig
+
+
+### Refactoring
+
+- *(env)* Extract matches_env_var_patterns helper, fix docs wording
+
+
+### Style
+
+- Run cargo fmt
+
+## [0.51.0] - 2026-05-09
+
+### Bug Fixes
+
+- *(tls_intercept)* Add authority key identifier to leaf certs
+
+
+### Features
+
+- *(proxy)* Extend ca trust to git clients
+
+- *(proxy)* Enhance audit context for managed auth and harden tls ca dir
+
+- *(audit)* Add structured context to network audit events
+
+- *(proxy)* Add tls interception for l7-bearing connect routes
+
+## [0.50.1] - 2026-05-08
+
+### Bug Fixes
+
+- Use native types for iotcl integers
+
+## [0.50.0] - 2026-05-08
+
+### Features
+
+- *(profile)* Support env:// URI in custom_credentials credential_key
+
+
+### Refactoring
+
+- *(cli)* Optimize ps command column width calculation
+
+- *(cli/ps)* Improve ps command display with dynamic columns
+
+## [0.49.0] - 2026-05-07
+
+### Bug Fixes
+
+- *(trust)* Treat empty parent() as CWD when deriving scan_root
+
+- *(trust)* Reject symlink-escape in multi-subject bundle subject names
+
+- *(trust)* Reject path traversal in multi-subject bundle subject names
+
+- *(yaml-merge)* Pin serde_yaml_ng to 0.10.0 and add reversal failure test
+
+
+### Dependencies
+
+- *(deps)* Bump tokio from 1.52.1 to 1.52.2
+
+
+### Features
+
+- *(wiring)* Add yaml_merge directive for YAML config patching
+
+
+### Miscellaneous
+
+- Add PR template requiring linked issue
+
+
+### Style
+
+- Apply rustfmt to trust_cmd and trust_scan
+
+- Apply rustfmt
+
+## [0.48.0] - 2026-05-07
+
+### Bug Fixes
+
+- *(cli)* Prevent truncate_chars panic and spurious truncation
+
+- Demote --allow-launch-services log from warn to debug
+
+- *(profile)* Skip self-references in sibling extends resolution
+
+
+### Features
+
+- *(cli)* Add shell completion generation via `nono completion <shell>`
+
+
+### Miscellaneous
+
+- Harden CI workflows and fix stale metadata
+
+- Reduce nono run output verbosity
+
+
+### Refactoring
+
+- *(string-truncation)* Extract generic string truncation utility
+
+## [0.47.1] - 2026-05-06
+
+### Dependencies
+
+- *(deps)* Bump jsonschema from 0.45.1 to 0.46.4
+
+- *(deps)* Bump rustls from 0.23.39 to 0.23.40
+
+
+### Documentation
+
+- Fix stale references, deprecation wording, and built-in vs pack distinction
 
 ## [0.47.0] - 2026-05-05
 

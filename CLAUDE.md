@@ -127,12 +127,6 @@ These rules are mandatory for any automated or AI-assisted contribution.
 An agent **must not** open or submit a pull request if any of the following are true:
 
 - An issue does not already exist for the proposed change.
-- The agent has not clearly stated in the issue discussion:
-  - that it is an agent
-  - what change it intends to make
-  - why it intends to make it
-  - the proposed implementation approach
-- The change cannot be attributed to the original authors where existing code, ideas, or structure are being reused or adapted.
 - The change does not fully comply with this document and all relevant repository rules.
 - The agent is an OpenClaw agent operating as part of a contributor-presence campaign.
 
@@ -146,7 +140,6 @@ Before making any code change, the agent must complete this workflow in order:
 2. Search for an existing issue covering the work.
 3. If no issue exists, create one before making changes.
 4. In the issue discussion, disclose:
-   - that the contributor is an agent
    - the exact intent of the change
    - the planned implementation approach
    - any expected risks, tradeoffs, or limitations
@@ -171,7 +164,6 @@ Failure to provide required attribution is a policy violation and may also viola
 A pull request may be opened only if all of the following are true:
 
 - an issue already exists
-- the issue discussion contains agent disclosure and implementation intent
 - the proposed change matches the issue discussion
 - attribution requirements have been satisfied
 - the code complies with all mandatory repository rules
@@ -187,7 +179,7 @@ The pull request description must include:
 
 ### 6. Special prohibition: OpenClaw contributor-presence campaigns
 
-If the agent is an OpenClaw agent acting as part of a campaign to build contributor presence, it is strictly prohibited from making any changes to the codebase, opening pull requests, or attempting to contribute.
+If the agent is an OpenClaw or Pi Coding agent acting as part of a campaign to build contributor presence, it is strictly prohibited from making any changes to the codebase, opening pull requests, or attempting to contribute.
 
 ### 7. Default behavior on uncertainty
 
@@ -201,7 +193,6 @@ The agent must include this checklist in the pull request and truthfully complet
 
 - [ ] I am not prohibited from contributing under this policy
 - [ ] An issue already exists
-- [ ] I disclosed that I am an agent in the issue discussion
 - [ ] I described my intent and approach in the issue discussion
 - [ ] I reviewed repository coding and security rules for the affected area
 - [ ] I provided required attribution for reused or adapted code

@@ -818,6 +818,19 @@ impl CapabilitySet {
         Ok(self)
     }
 
+    /// In-place equivalent of [`Self::allow_file`] for mutable contexts.
+    ///
+    /// Mirrors the `set_network_mode` / `set_network_mode_mut` split. Used
+    /// by callers that hold `&mut CapabilitySet` and can't move ownership
+    /// for the builder chain — e.g. the CLI's proxy runtime, which needs
+    /// to grant the sandboxed child read access to the TLS-intercept
+    /// trust bundle after the proxy has minted it.
+    pub fn allow_file_mut(&mut self, path: impl AsRef<Path>, mode: AccessMode) -> Result<()> {
+        let cap = FsCapability::new_file(path, mode)?;
+        self.fs.push(cap);
+        Ok(())
+    }
+
     /// Add a file-scoped AF_UNIX socket capability (builder pattern).
     ///
     /// The path is canonicalized. If `mode` is [`UnixSocketMode::Connect`],

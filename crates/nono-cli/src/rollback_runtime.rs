@@ -40,6 +40,7 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
+    pub(crate) redaction_policy: &'a nono::ScrubPolicy,
     pub(crate) started: &'a str,
     pub(crate) ended: &'a str,
     pub(crate) command: &'a [String],
@@ -463,6 +464,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         proxy_handle,
         executable_identity,
         audit_signer,
+        redaction_policy,
         started,
         ended,
         command,
@@ -494,6 +496,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         (0, None)
     };
 
+    let scrubbed_command = nono::scrub_argv_with_policy(command, redaction_policy);
     let mut audit_saved = false;
 
     if let Some(RollbackRuntimeState {
@@ -512,7 +515,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
             session_id: rb_session_id,
             started: started.to_string(),
             ended: Some(ended.to_string()),
-            command: command.to_vec(),
+            command: scrubbed_command.clone(),
             executable_identity: executable_identity.cloned(),
             tracked_paths,
             snapshot_count: manager.snapshot_count(),
@@ -528,6 +531,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 attestation_session_dir(&session_dir, audit_state),
                 &meta,
                 signer,
+                redaction_policy,
             )?);
         }
         manager.save_session_metadata(&meta)?;
@@ -561,7 +565,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 session_id: audit_state.session_id.clone(),
                 started: started.to_string(),
                 ended: Some(ended.to_string()),
-                command: command.to_vec(),
+                command: scrubbed_command,
                 executable_identity: executable_identity.cloned(),
                 tracked_paths,
                 snapshot_count: 0,
@@ -577,6 +581,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                     &audit_state.session_dir,
                     &meta,
                     signer,
+                    redaction_policy,
                 )?);
             }
             nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
@@ -870,6 +875,7 @@ mod tests {
             ),
             &metadata,
             &signer,
+            &nono::ScrubPolicy::secure_default(),
         )
         .expect("write attestation");
 

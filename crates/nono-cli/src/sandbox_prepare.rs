@@ -434,7 +434,9 @@ pub(crate) struct PreparedSandbox {
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    pub(crate) denied_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) mediation: crate::mediation::MediationConfig,
 }
@@ -592,7 +594,9 @@ pub(crate) fn maybe_enable_macos_launch_services(
     }
 
     caps.add_platform_rule("(allow lsopen)")?;
-    warn!("--allow-launch-services enabled: allowing direct LaunchServices opens on macOS");
+    tracing::debug!(
+        "--allow-launch-services enabled: allowing direct LaunchServices opens on macOS"
+    );
     Ok(true)
 }
 
@@ -1012,7 +1016,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 open_url_origins: Vec::new(),
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
+                ignored_denial_paths: Vec::new(),
                 allowed_env_vars: None,
+                denied_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
             },
             args,
@@ -1042,7 +1048,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_gpu: profile_allow_gpu,
         allow_parent_of_protected: profile_allow_parent_of_protected,
         bypass_protection_paths,
+        ignored_denial_paths,
         allowed_env_vars: profile_allowed_env_vars,
+        denied_env_vars: profile_denied_env_vars,
     } = prepared_profile;
 
     if let Some(profile) = loaded_profile.as_ref() {
@@ -1288,7 +1296,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             open_url_origins,
             open_url_allow_localhost,
             bypass_protection_paths,
+            ignored_denial_paths,
             allowed_env_vars: profile_allowed_env_vars,
+            denied_env_vars: profile_denied_env_vars,
             mediation: profile_mediation,
         },
         args,

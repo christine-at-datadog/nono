@@ -99,9 +99,13 @@ nono's trust boundary is agent containment — restricting what the sandboxed ch
 
 ### Session metadata on disk
 
-Session JSON files in `~/.nono/sessions/` contain supervisor and child PIDs, the full command line, profile name, working directory, and network mode. These files are protected by directory permissions (`0o700`) and file permissions (`0o600`), but are readable by any process running as the same user.
+Session JSON files in `~/.nono/sessions/` contain supervisor and child PIDs, the command line, profile name, working directory, and network mode. These files are protected by directory permissions (`0o700`) and file permissions (`0o600`), but are readable by any process running as the same user.
 
-Command-line arguments are persisted verbatim. Avoid passing secrets as CLI arguments — use the keystore or environment variables instead.
+nono applies best-effort redaction before persisting command arguments in session metadata, audit records, rollback metadata, and audit attestations. It scrubs common secret-bearing forms such as `--token VALUE`, `--api-key=VALUE`, sensitive HTTP headers, URL userinfo, and sensitive query parameters.
+
+The default redaction policy can be extended in `~/.config/nono/config.toml` with `[redaction].extra_flags`, `[redaction].extra_headers`, and `[redaction].extra_query_keys`. Removing a built-in default is treated as unsafe debugging behavior: `[redaction].allow_unredacted_defaults` is rejected unless `[redaction].unsafe_redaction_overrides = true` is also set. When a session uses a non-default redaction policy, audit events and audit attestations include a redaction-policy diff.
+
+This is a safety net, not a secret-management boundary. Avoid passing secrets as CLI arguments — use keystore-backed credential injection or proxy credential injection instead.
 
 ## The Two-Layer Architecture
 
@@ -173,7 +177,7 @@ macOS supervised mode provides rollback snapshots and diagnostic output, but doe
 
 ### macOS Claude Code keychain scope
 
-The built-in `claude-code` profile on macOS grants read-write access to the **user** keychain root:
+The `claude-code` profile on macOS grants read-write access to the **user** keychain root:
 
 - `~/Library/Keychains`
 
@@ -190,9 +194,9 @@ Security implication:
 
 - a process running under the macOS `claude-code` profile can interact with the user's keychain subtree, not just Claude-specific entries
 
-This was chosen as a compatibility tradeoff for the built-in Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the built-in `claude-code` profile.
+This was chosen as a compatibility tradeoff for the Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the pack-provided `claude-code` profile.
 
-For users who want the built-in Claude profile shape without macOS keychain access, nono also provides:
+For users who want the Claude profile shape without macOS keychain access, nono also provides:
 
 - `claude-no-kc`
 
@@ -265,6 +269,7 @@ The audit subsystem has a narrower security claim than the sandbox itself.
 - For supervised sessions, the supervisor hashes the resolved main executable binary and binds that `{ resolved_path, sha256 }` identity into session metadata and the global audit ledger.
 - When `--audit-sign-key` is configured, the supervisor also signs the session's audit Merkle root and session context using a keyed DSSE/in-toto attestation. The signature is written into the session directory and can later be checked with the corresponding public key.
 - That signature is produced once, at session finalization. nono does not sign each individual audit event.
+- Command arguments in session metadata and signed audit predicates are best-effort redacted before persistence. The redaction list is intentionally conservative for common flag, header, and URL patterns, but it is not a complete secret detector. User config may add local redaction names; removing defaults requires an explicit unsafe redaction override and is recorded as a policy diff in audit data.
 - That executable identity is not full runtime provenance. Shared libraries, interpreter chains, scripts passed as arguments, and dynamically loaded runtime dependencies are not covered by that binary hash.
 - The executable hash is computed before `exec`, not from the final kernel-loaded file descriptor. A privileged attacker with write access to the executable path could still race between hash and execution.
 - The keyed audit attestation is only as strong as the signing key distribution model. If the verifier does not pin the expected public key, a rewritten session could also rewrite the embedded public key and remain self-consistent.
@@ -391,6 +396,14 @@ If the child's traffic is captured (e.g., by a rogue library logging HTTP reques
 | Upstream TLS failure | Proxy returns 502 | Safe — no fallback to plaintext |
 
 The invariant matches the filesystem model: **if anything goes wrong, the child does not get access**.
+
+### Audit Durability Boundary
+
+Network proxy events are captured during the session, but the durable append-only audit log is finalized after the session ends rather than updated on every proxied request.
+
+This is an intentional performance tradeoff: the live request path only pays the cost of lightweight event capture, while the append-only hash chain and Merkleized audit summary are written during session finalization. The result is good post-run audit integrity, but not per-request durability.
+
+The security implication is narrow but real: if the supervisor or proxy is forcibly terminated mid-session, recent network events may be lost before they are committed into the append-only audit record. This does not weaken sandbox enforcement or credential isolation, but it does leave a temporary gap in forensic durability. Tightening that window is future work.
 
 ## macOS Model
 

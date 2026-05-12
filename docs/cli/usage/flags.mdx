@@ -3,8 +3,6 @@ title: CLI Reference
 description: Complete reference for all nono command-line flags
 ---
 
-Complete reference for all nono command-line flags.
-
 ## Global Options
 
 These options work with all commands.
@@ -51,6 +49,27 @@ NONO_THEME=latte nono run --allow-cwd -- codex
 
 If an unknown theme is supplied, nono falls back to `mocha`.
 
+### Redaction Policy
+
+Command arguments persisted in sessions, audit logs, rollback metadata, and audit attestations are redacted with a secure default policy. You can extend the policy in `~/.config/nono/config.toml`:
+
+```toml
+[redaction]
+extra_flags = ["--private-token", "--pat"]
+extra_headers = ["Private-Token"]
+extra_query_keys = ["sig", "signature"]
+```
+
+To stop redacting a built-in default for debugging, you must opt in explicitly:
+
+```toml
+[redaction]
+unsafe_redaction_overrides = true
+allow_unredacted_defaults = ["state"]
+```
+
+Non-default redaction policies are recorded as a diff in audit event logs and audit attestations.
+
 ## Commands
 
 ### `nono run`
@@ -93,7 +112,7 @@ nono why --self --path <PATH> --op <OP> [OPTIONS]  # Inside sandbox
 
 ### `nono learn`
 
-Trace a command to discover required filesystem paths and network activity. Uses `strace` on Linux and `fs_usage` + `nettop` on macOS to monitor accesses and outputs paths and connections that would need to be allowed in a nono profile.
+Discover required filesystem paths and network activity. On Linux, `nono learn` uses `strace`. On macOS, use `nono run --profile <name> -- <command>` for sandboxed profile learning; legacy unsandboxed tracing is available with `nono learn --trace`.
 
 ```bash
 nono learn [OPTIONS] -- <COMMAND> [ARGS...]
@@ -117,7 +136,7 @@ nono profile <SUBCOMMAND>
 
 Subcommands:
 - `init` - Generate a skeleton profile JSON file
-- `list` - List all available profiles (built-in and user)
+- `list` - List all available profiles (preset, pack, and user)
 - `show` - Show a fully resolved profile
 - `diff` - Diff two profiles
 - `validate` - Validate a profile JSON file
@@ -147,7 +166,7 @@ Subcommands:
 ## `nono learn` Options
 
 <Note>
-  `nono learn` runs WITHOUT sandbox restrictions to discover what paths and network connections your application needs. On Linux it uses `strace` (install with `apt install strace`). On macOS it uses `fs_usage` and `nettop` for filesystem and network discovery (requires `sudo`).
+  On Linux, `nono learn` runs WITHOUT sandbox restrictions using `strace` (install with `apt install strace`). On macOS, profile learning happens through sandboxed `nono run`; use `nono learn --trace` only when you explicitly want the legacy unsandboxed `fs_usage` + `nettop` tracer.
 </Note>
 
 ### `--profile`, `-p`
@@ -180,6 +199,14 @@ Show all accessed paths, not just those that would be blocked by the sandbox.
 
 ```bash
 nono learn --all -- my-app
+```
+
+### `--trace`
+
+On macOS, use the legacy unsandboxed `fs_usage` + `nettop` tracer.
+
+```bash
+nono learn --trace -- my-app
 ```
 
 ### `--verbose`, `-v`
@@ -257,6 +284,29 @@ Grant write-only access to a single file.
 ```bash
 nono run --write-file ./output.log -- command
 ```
+
+### Denial Prompt Control
+
+#### `--suppress-save-prompt`
+
+Suppress the post-run save-profile prompt for denials under a path. This does
+not grant access and does not remove the diagnostic footer; it only prevents
+the same denied path from being offered as a profile addition repeatedly.
+
+```bash
+nono run --profile claude-code \
+  --suppress-save-prompt ~/.copilot/settings.json \
+  -- claude
+```
+
+For persistent behavior, put the same path in
+`filesystem.suppress_save_prompt` in a user profile. The older
+`--ignore-denied` spelling is accepted as an alias, but the suppress wording is
+preferred because this flag never turns a denial into an allow rule.
+
+When nono offers to save denied paths after a run, choosing `suppress` writes
+all listed path suggestions to `filesystem.suppress_save_prompt` instead of
+adding them as filesystem grants.
 
 ### AF_UNIX Socket Permissions
 
@@ -359,7 +409,7 @@ nono run --allow-cwd --network-profile minimal --allow-domain custom-api.example
 
 #### `--credential`
 
-Enable credential injection for a named service via the reverse proxy. The service must be either a built-in service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, or from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI.
+Enable credential injection for a named service via the reverse proxy. The service must be either a preset service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI, from a file when `credential_key` is a `file://` URI, or from the host environment when `credential_key` is an `env://` URI.
 
 ```bash
 # Inject OpenAI credentials (loads from keyring account "openai_api_key")
@@ -372,7 +422,7 @@ nono run --allow-cwd --network-profile claude-code \
 
 The proxy sets `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, etc. in the child environment so SDKs route through the proxy automatically.
 
-Custom credentials can be defined in profiles for APIs not covered by the built-in services:
+Custom credentials can be defined in profiles for APIs not covered by the preset services:
 
 ```json
 {
@@ -676,7 +726,7 @@ See [Credential Injection](/cli/features/credential-injection) for full document
 
 #### `--profile`, `-p`
 
-Use a named profile (built-in or from `~/.config/nono/profiles/`).
+Use a named profile (from installed packs or `~/.config/nono/profiles/`).
 
 ```bash
 nono run --profile claude-code -- claude
@@ -857,7 +907,7 @@ The supervisor:
 
 1. records audit events during the session
 2. computes the session's final audit Merkle root
-3. signs that final root plus session context
+3. signs that final root plus redacted session context
 4. writes the resulting keyed DSSE attestation to `audit-attestation.bundle`
 
 A summary is also recorded in `session.json`.
@@ -889,7 +939,7 @@ nono audit verify <session-id> --public-key-file ./audit-signing-key.pub
 ```
 
 <Note>
-  `--audit-sign-key` signs the session audit Merkle root and session context once, after the session completes. It does not, by itself, add an external timestamp, Rekor entry, or full runtime-closure attestation.
+  `--audit-sign-key` signs the session audit Merkle root and session context once, after the session completes. Command arguments in that context are best-effort redacted for common secret-bearing flags, headers, and URLs. This does not, by itself, add an external timestamp, Rekor entry, or full runtime-closure attestation.
 </Note>
 
 #### `--rollback-exclude`
