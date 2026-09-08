@@ -2701,6 +2701,10 @@ pub struct AuditCleanupArgs {
     #[arg(long, value_name = "DAYS")]
     pub older_than: Option<u64>,
 
+    /// Remove oldest sessions until the remaining total is under N megabytes
+    #[arg(long, value_name = "MB")]
+    pub max_total_size: Option<u64>,
+
     /// Show what would be removed without deleting
     #[arg(long)]
     pub dry_run: bool,
@@ -3540,6 +3544,21 @@ mod tests {
                     assert_eq!(cleanup_args.keep, Some(5));
                     assert!(cleanup_args.dry_run);
                     assert!(!cleanup_args.all);
+                }
+                _ => panic!("Expected Cleanup subcommand"),
+            },
+            _ => panic!("Expected Audit command"),
+        }
+    }
+
+    #[test]
+    fn test_audit_cleanup_max_total_size() {
+        let cli = Cli::parse_from(["nono", "audit", "cleanup", "--max-total-size", "500"]);
+        match cli.command {
+            Commands::Audit(args) => match args.command {
+                AuditCommands::Cleanup(cleanup_args) => {
+                    assert_eq!(cleanup_args.max_total_size, Some(500));
+                    assert!(cleanup_args.keep.is_none());
                 }
                 _ => panic!("Expected Cleanup subcommand"),
             },
