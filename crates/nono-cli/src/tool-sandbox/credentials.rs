@@ -5,14 +5,70 @@ use nono::{NonoError, Result};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Why a `local-socket` credential's socket could not be resolved at session start.
+///
+/// The distinction decides whether the session continues. A socket that is
+/// merely absent is an ordinary runtime state, while a path that resolves to
+/// something other than a socket contradicts what the profile declared.
+#[derive(Debug, Clone)]
+pub(crate) enum LocalSocketUnavailable {
+    /// Nothing is listening at the configured location: the path template's
+    /// variable is unset, or it expanded to a path that no longer resolves.
+    /// Both are ordinary states for an agent socket — one that was never
+    /// started, or one that exited and left a stale path behind — so the
+    /// credential is omitted and commands that declare it still run.
+    Absent(String),
+    /// The path resolves to something that is not a socket. The profile
+    /// asserted a socket lives here and that assertion is false, so this stays
+    /// fatal rather than degrading into a silently omitted credential.
+    NotASocket(String),
+}
+
+impl LocalSocketUnavailable {
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::Absent(reason) | Self::NotASocket(reason) => reason,
+        }
+    }
+}
+
+/// Whether a socket resolved at session start is still usable right now.
+///
+/// Credentials resolve once per session, but a socket can vanish while the
+/// session runs — the agent exits, or a lock cycle tears it down. A
+/// `UnixSocketCapability` naming a path that no longer holds a socket is
+/// rejected when it is constructed, so without this re-check the command would
+/// abort exactly as it did before this degrade existed, one race window later.
+/// Checking here turns that into the same omission an absent socket gets.
+///
+/// This is inherently a race: the socket can disappear between the check and
+/// the connect. That is fine, because losing the race costs a refused
+/// connection inside the command rather than a capability the command should
+/// not have had.
+pub(crate) fn local_socket_is_live(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum ResolvedCredential {
     LocalSocket {
+        /// `None` when the socket could not be resolved at session start.
         path: Option<PathBuf>,
         env_var: Option<String>,
-        unavailable_reason: Option<String>,
+        /// Why `path` is `None`, which decides what the consumption sites do:
+        /// [`LocalSocketUnavailable::Absent`] is omitted so the command still
+        /// runs, while [`LocalSocketUnavailable::NotASocket`] is fatal.
+        ///
+        /// The fatal case is raised per command rather than at session start on
+        /// purpose. Failing during [`resolve_credentials`] would abort the whole
+        /// session before the agent launched, which is a wider blast radius than
+        /// the behaviour it replaced — one contradicted credential would take
+        /// down every command, including those that never declared it.
+        unavailable: Option<LocalSocketUnavailable>,
     },
     RawFile {
         path: PathBuf,
@@ -49,16 +105,34 @@ pub(crate) fn resolve_credentials(
                 let socket_template = credential.path.as_ref().ok_or_else(|| {
                     NonoError::ConfigParse(format!("local-socket credential '{name}' missing path"))
                 })?;
-                let (path, unavailable_reason) = match resolve_local_socket_path(socket_template) {
+                let (path, unavailable) = match resolve_local_socket_path(socket_template) {
                     Ok(socket) => (Some(socket), None),
-                    Err(reason) => (None, Some(reason)),
+                    Err(unavailable) => {
+                        // Warn once here, at session start, rather than at the
+                        // per-command consumption sites: those run for every
+                        // invocation of every command that declares the
+                        // credential, which would repeat one host-level fact
+                        // on a loop. Only the degrading case is warned about —
+                        // a contradicted declaration reports itself by failing
+                        // the command that asked for it. The reason
+                        // interpolates a filesystem path, so it is sanitized
+                        // before reaching a terminal.
+                        if let LocalSocketUnavailable::Absent(reason) = &unavailable {
+                            tracing::warn!(
+                                credential = %name,
+                                reason = %crate::terminal_approval::sanitize_for_terminal(reason),
+                                "local-socket credential unavailable; commands declaring it run without it"
+                            );
+                        }
+                        (None, Some(unavailable))
+                    }
                 };
                 resolved.insert(
                     name.clone(),
                     ResolvedCredential::LocalSocket {
                         path,
                         env_var: credential.env_var.clone(),
-                        unavailable_reason,
+                        unavailable,
                     },
                 );
             }
@@ -119,33 +193,50 @@ pub(crate) fn resolve_credentials(
     Ok(resolved)
 }
 
-fn resolve_local_socket_path(value: &str) -> std::result::Result<PathBuf, String> {
+fn resolve_local_socket_path(value: &str) -> std::result::Result<PathBuf, LocalSocketUnavailable> {
     // Expand `$VAR` references anywhere in the string (e.g.
     // `$XDG_RUNTIME_DIR/ghtkn/agent.sock`), matching the policy-path expansion
     // used elsewhere. Strict expansion errors on an unset variable instead of
     // silently collapsing `$VAR/suffix` to `/suffix` — a silent path-widening bug.
     let expanded = crate::policy::expand_env_vars_strict(value).map_err(|e| match e {
-        NonoError::EnvVarValidation { var, .. } => format!("{var} is unset"),
-        other => other.to_string(),
+        NonoError::EnvVarValidation { var, .. } => {
+            LocalSocketUnavailable::Absent(format!("{var} is unset"))
+        }
+        other => LocalSocketUnavailable::Absent(other.to_string()),
     })?;
     let path = PathBuf::from(expanded);
-    let canonical = path
-        .canonicalize()
-        .map_err(|source| format!("failed to resolve {}: {source}", path.display()))?;
-    let metadata = fs::metadata(&canonical)
-        .map_err(|source| format!("failed to stat {}: {source}", canonical.display()))?;
+    let canonical = path.canonicalize().map_err(|source| {
+        LocalSocketUnavailable::Absent(format!("failed to resolve {}: {source}", path.display()))
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|source| {
+        LocalSocketUnavailable::Absent(format!("failed to stat {}: {source}", canonical.display()))
+    })?;
     if !metadata.file_type().is_socket() {
-        return Err(format!("{} is not a socket", canonical.display()));
+        return Err(LocalSocketUnavailable::NotASocket(format!(
+            "{} is not a socket",
+            canonical.display()
+        )));
     }
     Ok(canonical)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_local_socket_path;
+    use super::{LocalSocketUnavailable, resolve_local_socket_path};
     use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+
+    /// Assert the resolver reported the socket as merely absent — the class that
+    /// degrades to an omitted credential — and return the reason text.
+    fn expect_absent(err: LocalSocketUnavailable) -> String {
+        match err {
+            LocalSocketUnavailable::Absent(reason) => reason,
+            LocalSocketUnavailable::NotASocket(reason) => {
+                panic!("expected an absent socket, got not-a-socket: {reason}")
+            }
+        }
+    }
 
     const DIR_VAR: &str = "NONO_TEST_CREDENTIAL_SOCKET_DIR";
     const UNSET_VAR: &str = "NONO_TEST_CREDENTIAL_SOCKET_UNSET";
@@ -186,7 +277,7 @@ mod tests {
         env.remove(UNSET_VAR);
         let err = resolve_local_socket_path(&format!("${UNSET_VAR}/agent.sock"))
             .expect_err("unset var must fail");
-        assert_eq!(err, format!("{UNSET_VAR} is unset"));
+        assert_eq!(expect_absent(err), format!("{UNSET_VAR} is unset"));
     }
 
     #[test]
@@ -218,7 +309,43 @@ mod tests {
         env.remove(unset);
         let err = resolve_local_socket_path(&format!("/tmp/${unset}/agent.sock"))
             .expect_err("unset mid-string var must fail");
-        assert_eq!(err, format!("{unset} is unset"));
+        assert_eq!(expect_absent(err), format!("{unset} is unset"));
+    }
+
+    /// A path that no longer resolves is absence, not misconfiguration: an agent
+    /// that has exited leaves its variable set and its socket gone, and the
+    /// commands declaring it must still run.
+    #[test]
+    fn missing_socket_path_is_absent_not_fatal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("never-created.sock");
+        let err = resolve_local_socket_path(missing.to_str().expect("utf8 path"))
+            .expect_err("missing socket must fail");
+        let reason = expect_absent(err);
+        assert!(
+            reason.starts_with("failed to resolve "),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    /// A path that resolves to a non-socket contradicts the profile's
+    /// declaration, so it stays fatal instead of degrading into a silently
+    /// omitted credential.
+    #[test]
+    fn regular_file_is_not_a_socket_and_stays_fatal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let regular = tmp.path().join("agent.sock");
+        std::fs::write(&regular, b"not a socket").expect("write regular file");
+        let err = resolve_local_socket_path(regular.to_str().expect("utf8 path"))
+            .expect_err("regular file must fail");
+        match err {
+            LocalSocketUnavailable::NotASocket(reason) => {
+                assert!(reason.ends_with(" is not a socket"), "reason: {reason}");
+            }
+            LocalSocketUnavailable::Absent(reason) => {
+                panic!("a regular file must not degrade to absent: {reason}")
+            }
+        }
     }
 
     #[test]
