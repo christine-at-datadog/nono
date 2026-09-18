@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -45,7 +45,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
@@ -164,7 +164,25 @@ struct ToolSandboxState {
     /// these is rejected (the agent's broad allow may otherwise cover them).
     deny_paths: Vec<PathBuf>,
     plan: ResolvedToolSandboxPlan,
-    shims_by_command: BTreeMap<String, ShimIdentity>,
+    /// Canonical shim path per mediated command, fixed at materialisation.
+    ///
+    /// A healed shim is rewritten at the same path, so this map never changes
+    /// and can be read without synchronisation.
+    shim_paths: BTreeMap<String, PathBuf>,
+    /// Current (st_dev, st_ino) per mediated command.
+    ///
+    /// Healing a reaped shim produces a new inode, so unlike the paths this is
+    /// mutable session state. The write guard also serialises healing itself.
+    shim_ids: RwLock<BTreeMap<String, FileId>>,
+    /// Shim source held open for the session's lifetime.
+    ///
+    /// The runtime dir lives under a directory the OS may prune (macOS reaps
+    /// `/tmp` entries untouched for three days), and `nono-shim-src` is as
+    /// reapable as the shims themselves. An open descriptor keeps the bytes
+    /// reachable after the path is gone, and pins them to the binary this
+    /// session started with so a mid-session upgrade cannot change what a
+    /// healed shim contains.
+    shim_source: File,
     shims_by_path: BTreeMap<PathBuf, String>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
     proxy_trust_bundle_paths: Vec<PathBuf>,
@@ -302,7 +320,8 @@ impl PreparedToolSandboxRuntime {
         let credential_handles =
             resolve_credentials(&plan.config.credentials, proxy_credential_env_vars)?;
 
-        let mut shims_by_command = BTreeMap::new();
+        let mut shim_paths = BTreeMap::new();
+        let mut shim_ids = BTreeMap::new();
         let mut shims_by_path = BTreeMap::new();
         let mut shim_names: BTreeSet<String> = plan.resolved.commands.keys().cloned().collect();
         shim_names.extend(plan.deny_only.keys().cloned());
@@ -310,7 +329,8 @@ impl PreparedToolSandboxRuntime {
         for name in shim_names {
             let identity = materialize_shim(&shim_source, &shim_dir, &name)?;
             shims_by_path.insert(identity.path.clone(), name.clone());
-            shims_by_command.insert(name, identity);
+            shim_ids.insert(name.clone(), identity.id);
+            shim_paths.insert(name, identity.path);
         }
         // Materialize the browser-open shim only when URL opening is enabled.
         // It is a distinct copy of the nono binary named `open`, so a brokered
@@ -324,6 +344,12 @@ impl PreparedToolSandboxRuntime {
         } else {
             None
         };
+        // Opened before the dir is sealed, and kept for the session so a
+        // healed shim never depends on `nono-shim-src` still existing.
+        let shim_source = File::open(&shim_source).map_err(|e| NonoError::ConfigRead {
+            path: shim_source.clone(),
+            source: e,
+        })?;
         seal_shim_dir(&shim_dir)?;
 
         let approval_backends = crate::approval_runtime::build_approval_registry(&plan.config)?;
@@ -343,7 +369,9 @@ impl PreparedToolSandboxRuntime {
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
                 plan,
-                shims_by_command,
+                shim_paths,
+                shim_ids: RwLock::new(shim_ids),
+                shim_source,
                 shims_by_path,
                 credential_handles,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
@@ -422,8 +450,8 @@ impl PreparedToolSandboxRuntime {
             &self.inner.shim_dir,
             AccessMode::Read,
         )?);
-        for shim in self.inner.shims_by_command.values() {
-            caps.add_fs(FsCapability::new_file(&shim.path, AccessMode::Read)?);
+        for path in self.inner.shim_paths.values() {
+            caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
         }
         caps.add_unix_socket(UnixSocketCapability::new_file(
             &self.inner.socket_path,
@@ -445,10 +473,7 @@ impl PreparedToolSandboxRuntime {
         if program.contains('/') {
             return None;
         }
-        self.inner
-            .shims_by_command
-            .get(program)
-            .map(|identity| identity.path.as_path())
+        self.inner.shim_paths.get(program).map(PathBuf::as_path)
     }
 
     /// Initial command identity gate when macOS tool-sandbox is active.
@@ -457,9 +482,7 @@ impl PreparedToolSandboxRuntime {
         original_program: &str,
         resolved_program: &Path,
     ) -> Result<Option<NonoError>> {
-        if !original_program.contains('/')
-            && self.inner.shims_by_command.contains_key(original_program)
-        {
+        if !original_program.contains('/') && self.inner.shim_paths.contains_key(original_program) {
             return Ok(None);
         }
 
@@ -1821,16 +1844,21 @@ fn authenticate_shim(stream: &UnixStream, state: &ToolSandboxState) -> Result<Sh
             exe_path.display()
         ))
     })?;
-    let identity = state.shims_by_command.get(&command).ok_or_else(|| {
-        NonoError::SandboxInit(format!(
-            "tool-sandbox shim auth: missing identity for {command}"
-        ))
-    })?;
+    let expected_id = *state
+        .shim_ids
+        .read()
+        .map_err(|_| NonoError::SandboxInit("tool-sandbox shim id lock poisoned".to_string()))?
+        .get(&command)
+        .ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox shim auth: missing identity for {command}"
+            ))
+        })?;
     let meta = fs::metadata(&exe_path).map_err(|e| NonoError::ConfigRead {
         path: exe_path.clone(),
         source: e,
     })?;
-    if identity.id != file_id(&meta) {
+    if expected_id != file_id(&meta) {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox shim auth: inode mismatch for {}",
             exe_path.display()
@@ -3304,9 +3332,14 @@ fn add_executable_shape_baseline(
 }
 
 fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &ToolSandboxState) -> Result<()> {
+    // Every mediated launch grants read on every shim, so one reaped shim
+    // fails the whole set and therefore every mediated command for the rest of
+    // the session. Heal first so a pruned runtime dir costs one rewrite rather
+    // than ending mediation.
+    heal_missing_shims(state)?;
     caps.add_fs(FsCapability::new_dir(&state.shim_dir, AccessMode::Read)?);
-    for shim in state.shims_by_command.values() {
-        caps.add_fs(FsCapability::new_file(&shim.path, AccessMode::Read)?);
+    for path in state.shim_paths.values() {
+        caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
     }
     caps.add_unix_socket(UnixSocketCapability::new_file(
         &state.socket_path,
@@ -3415,12 +3448,7 @@ fn add_child_process_exec_gate_with_policy(
         }
         allowed.push(interpreter);
     }
-    allowed.extend(
-        state
-            .shims_by_command
-            .values()
-            .map(|identity| identity.path.clone()),
-    );
+    allowed.extend(state.shim_paths.values().cloned());
     if let Some(policy) = policy {
         // A bare `open` always resolves to this shim (mediated $PATH puts the
         // shim dir first) once any command needs one, so both `open_urls` and
@@ -5564,6 +5592,159 @@ fn materialize_shim(shim_source: &Path, runtime_dir: &Path, name: &str) -> Resul
     })
 }
 
+/// Rewrite any shim missing from the shim dir, and re-record its identity.
+///
+/// The runtime dir sits under a path the OS may prune: macOS runs
+/// `/usr/libexec/tmp_cleaner` nightly over `/tmp` and deletes files untouched
+/// for three days. `mtime` and `ctime` are fixed at materialisation and only
+/// `atime` advances, so a session living past that window loses every shim it
+/// has not run recently -- which breaks *all* mediated commands, because each
+/// launch grants read on the whole shim set.
+///
+/// Healing restores the session instead of ending it. The write guard
+/// serialises concurrent launches so two of them cannot rewrite one shim at
+/// once, and the rewrite never trusts the destination path: bytes come from
+/// the retained source descriptor, land on a temporary name, and are renamed
+/// over whatever is there. The recorded identity is read from the descriptor
+/// that was written, never by stat-ing the path afterwards, so a file planted
+/// at the destination can never be adopted as a shim.
+fn heal_missing_shims(state: &ToolSandboxState) -> Result<()> {
+    let missing: Vec<(&String, &PathBuf)> = state
+        .shim_paths
+        .iter()
+        .filter(|(_, path)| !path.exists())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut ids = state
+        .shim_ids
+        .write()
+        .map_err(|_| NonoError::SandboxInit("tool-sandbox shim id lock poisoned".to_string()))?;
+
+    // Another launch may have healed these while we waited for the guard.
+    let missing: Vec<(&String, &PathBuf)> = missing
+        .into_iter()
+        .filter(|(_, path)| !path.exists())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    unseal_shim_dir(&state.shim_dir)?;
+    let healed = (|| -> Result<Vec<(String, FileId)>> {
+        let mut healed = Vec::with_capacity(missing.len());
+        for (name, path) in missing {
+            warn!(
+                shim = %name,
+                path = %path.display(),
+                "tool-sandbox shim missing from runtime dir; rewriting it"
+            );
+            healed.push((name.clone(), rewrite_shim(&state.shim_source, path)?));
+        }
+        Ok(healed)
+    })();
+    // Reseal whether or not the rewrite succeeded, so a failure cannot leave
+    // the shim dir writable for the rest of the session.
+    let seal = seal_shim_dir(&state.shim_dir);
+    let healed = healed?;
+    seal?;
+
+    for (name, id) in healed {
+        ids.insert(name, id);
+    }
+    Ok(())
+}
+
+/// Copy the retained shim source over `shim_path`, returning the new identity.
+///
+/// The identity comes from the descriptor this function wrote, so it always
+/// describes the bytes it placed there.
+fn rewrite_shim(source: &File, shim_path: &Path) -> Result<FileId> {
+    let dir = shim_path.parent().ok_or_else(|| {
+        NonoError::SandboxInit(format!(
+            "tool-sandbox: shim path has no parent: {}",
+            shim_path.display()
+        ))
+    })?;
+    let file_name = shim_path.file_name().ok_or_else(|| {
+        NonoError::SandboxInit(format!(
+            "tool-sandbox: shim path has no file name: {}",
+            shim_path.display()
+        ))
+    })?;
+    let mut staged = dir.join(file_name);
+    staged
+        .as_mut_os_string()
+        .push(format!(".heal-{}", std::process::id()));
+    // Callers hold the shim-id write guard, so the only file that can be here
+    // is a leftover from a heal that died mid-rewrite.
+    if staged.exists() {
+        fs::remove_file(&staged).map_err(|e| NonoError::ConfigWrite {
+            path: staged.clone(),
+            source: e,
+        })?;
+    }
+
+    let id = (|| -> Result<FileId> {
+        let mut reader = source.try_clone().map_err(|e| NonoError::ConfigRead {
+            path: shim_path.to_path_buf(),
+            source: e,
+        })?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| NonoError::ConfigRead {
+                path: shim_path.to_path_buf(),
+                source: e,
+            })?;
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o500)
+            .open(&staged)
+            .map_err(|e| NonoError::ConfigWrite {
+                path: staged.clone(),
+                source: e,
+            })?;
+        std::io::copy(&mut reader, &mut writer).map_err(|e| NonoError::ConfigWrite {
+            path: staged.clone(),
+            source: e,
+        })?;
+        // Identity of the descriptor just written; `rename` preserves the
+        // inode, so this stays correct at the destination.
+        let meta = writer.metadata().map_err(|e| NonoError::ConfigRead {
+            path: staged.clone(),
+            source: e,
+        })?;
+        Ok(file_id(&meta))
+    })();
+
+    match id {
+        Ok(id) => {
+            fs::rename(&staged, shim_path).map_err(|e| NonoError::ConfigWrite {
+                path: shim_path.to_path_buf(),
+                source: e,
+            })?;
+            Ok(id)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&staged);
+            Err(err)
+        }
+    }
+}
+
+/// Lift the shim dir seal so a shim can be rewritten.
+fn unseal_shim_dir(shim_dir: &Path) -> Result<()> {
+    fs::set_permissions(shim_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+        NonoError::ConfigWrite {
+            path: shim_dir.to_path_buf(),
+            source: e,
+        }
+    })
+}
+
 fn seal_shim_dir(shim_dir: &Path) -> Result<()> {
     fs::set_permissions(shim_dir, fs::Permissions::from_mode(0o500)).map_err(|e| {
         NonoError::ConfigWrite {
@@ -5682,7 +5863,11 @@ mod tests {
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypass_ids: HashSet::new(),
             },
-            shims_by_command: BTreeMap::new(),
+            shim_paths: BTreeMap::new(),
+            shim_ids: RwLock::new(BTreeMap::new()),
+            // No shim is materialised for this state, so the source is never
+            // read; `/dev/null` keeps the field honest without a temp dir.
+            shim_source: File::open("/dev/null").expect("open /dev/null"),
             shims_by_path: BTreeMap::new(),
             credential_handles: BTreeMap::new(),
             proxy_trust_bundle_paths: Vec::new(),
@@ -7240,6 +7425,192 @@ mod tests {
         let second = materialize_shim(&source_path, dir.path(), "xargs")?;
 
         assert_ne!(first.id, second.id);
+        Ok(())
+    }
+
+    /// Build a sealed shim dir with `names` materialised, plus the state that
+    /// owns it, mirroring what `prepare` leaves behind.
+    fn heal_fixture(names: &[&str]) -> Result<(tempfile::TempDir, ToolSandboxState)> {
+        let tmp = test_tempdir()?;
+        let shim_dir = tmp.path().join("shims");
+        fs::create_dir(&shim_dir).map_err(|source| NonoError::ConfigWrite {
+            path: shim_dir.clone(),
+            source,
+        })?;
+        let source_path = materialize_shim_source(&shim_dir)?;
+
+        let mut shim_paths = BTreeMap::new();
+        let mut shim_ids = BTreeMap::new();
+        let mut shims_by_path = BTreeMap::new();
+        for name in names {
+            let identity = materialize_shim(&source_path, &shim_dir, name)?;
+            shims_by_path.insert(identity.path.clone(), (*name).to_string());
+            shim_ids.insert((*name).to_string(), identity.id);
+            shim_paths.insert((*name).to_string(), identity.path);
+        }
+        let shim_source = File::open(&source_path).map_err(|source| NonoError::ConfigRead {
+            path: source_path.clone(),
+            source,
+        })?;
+        seal_shim_dir(&shim_dir)?;
+
+        let mut state = test_state();
+        state.shim_dir = shim_dir;
+        state.shim_paths = shim_paths;
+        state.shim_ids = RwLock::new(shim_ids);
+        state.shim_source = shim_source;
+        state.shims_by_path = shims_by_path;
+        Ok((tmp, state))
+    }
+
+    /// Delete a file from a sealed shim dir the way the OS reaper does --
+    /// as root, so the 0o500 seal is no obstacle.
+    fn reap(shim_dir: &Path, path: &Path) -> Result<()> {
+        unseal_shim_dir(shim_dir)?;
+        fs::remove_file(path).map_err(|source| NonoError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        seal_shim_dir(shim_dir)
+    }
+
+    fn shim_path_of(state: &ToolSandboxState, name: &str) -> Result<PathBuf> {
+        state
+            .shim_paths
+            .get(name)
+            .cloned()
+            .ok_or_else(|| NonoError::SandboxInit(format!("test fixture has no {name} shim path")))
+    }
+
+    fn recorded_ids(state: &ToolSandboxState) -> Result<BTreeMap<String, FileId>> {
+        let ids = state
+            .shim_ids
+            .read()
+            .map_err(|_| NonoError::SandboxInit("shim id lock poisoned".to_string()))?;
+        Ok(ids.clone())
+    }
+
+    fn recorded_id(state: &ToolSandboxState, name: &str) -> Result<FileId> {
+        recorded_ids(state)?
+            .get(name)
+            .copied()
+            .ok_or_else(|| NonoError::SandboxInit(format!("test fixture has no {name} shim id")))
+    }
+
+    fn mode_of(path: &Path) -> Result<u32> {
+        let meta = fs::metadata(path).map_err(|source| NonoError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(meta.permissions().mode() & 0o777)
+    }
+
+    fn on_disk_id(path: &Path) -> Result<FileId> {
+        let meta = fs::metadata(path).map_err(|source| NonoError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(file_id(&meta))
+    }
+
+    fn contents_of(path: &Path) -> Result<Vec<u8>> {
+        fs::read(path).map_err(|source| NonoError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    #[test]
+    fn a_reaped_shim_is_rewritten_and_its_new_identity_recorded() -> Result<()> {
+        let (_tmp, state) = heal_fixture(&["git", "curl"])?;
+        let curl = shim_path_of(&state, "curl")?;
+        let git = shim_path_of(&state, "git")?;
+        let git_id_before = recorded_id(&state, "git")?;
+
+        reap(&state.shim_dir, &curl)?;
+        assert!(!curl.exists());
+
+        heal_missing_shims(&state)?;
+
+        // The reaped shim is back, byte-identical to the source.
+        assert!(curl.exists());
+        assert_eq!(
+            contents_of(&curl)?,
+            contents_of(&state.shim_dir.join("nono-shim-src"))?
+        );
+        // Its identity was re-recorded, so shim authentication still matches.
+        assert_eq!(recorded_id(&state, "curl")?, on_disk_id(&curl)?);
+        // An untouched shim is left exactly as it was.
+        assert_eq!(recorded_id(&state, "git")?, git_id_before);
+        assert!(git.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn healing_preserves_the_shim_dir_seal_and_shim_mode() -> Result<()> {
+        let (_tmp, state) = heal_fixture(&["git"])?;
+        let git = shim_path_of(&state, "git")?;
+
+        reap(&state.shim_dir, &git)?;
+        heal_missing_shims(&state)?;
+
+        assert_eq!(mode_of(&state.shim_dir)?, 0o500);
+        assert_eq!(mode_of(&git)?, 0o500);
+        Ok(())
+    }
+
+    #[test]
+    fn healing_survives_the_shim_source_being_reaped_too() -> Result<()> {
+        // The reaper takes every stale file, and `nono-shim-src` is as stale as
+        // the shims. Healing must not depend on it still being on disk.
+        let (_tmp, state) = heal_fixture(&["git"])?;
+        let git = shim_path_of(&state, "git")?;
+        let source_path = state.shim_dir.join("nono-shim-src");
+
+        reap(&state.shim_dir, &git)?;
+        reap(&state.shim_dir, &source_path)?;
+        assert!(!source_path.exists());
+
+        heal_missing_shims(&state)?;
+
+        assert!(git.exists());
+        assert_eq!(recorded_id(&state, "git")?, on_disk_id(&git)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_planted_at_a_shim_path_never_becomes_its_identity() -> Result<()> {
+        // Healing only rewrites what is missing, and the recorded identity
+        // always comes from the descriptor a rewrite wrote. A file planted at
+        // a shim path is therefore never adopted: authentication compares the
+        // stale recorded inode and refuses it.
+        let (_tmp, state) = heal_fixture(&["git"])?;
+        let git = shim_path_of(&state, "git")?;
+
+        reap(&state.shim_dir, &git)?;
+        unseal_shim_dir(&state.shim_dir)?;
+        fs::write(&git, b"#!/bin/sh\nexfiltrate\n").map_err(|source| NonoError::ConfigWrite {
+            path: git.clone(),
+            source,
+        })?;
+        seal_shim_dir(&state.shim_dir)?;
+        let planted_id = on_disk_id(&git)?;
+
+        heal_missing_shims(&state)?;
+
+        assert_ne!(recorded_id(&state, "git")?, planted_id);
+        Ok(())
+    }
+
+    #[test]
+    fn healing_is_a_no_op_when_every_shim_is_present() -> Result<()> {
+        let (_tmp, state) = heal_fixture(&["git", "curl"])?;
+        let before = recorded_ids(&state)?;
+
+        heal_missing_shims(&state)?;
+
+        assert_eq!(recorded_ids(&state)?, before);
+        assert_eq!(mode_of(&state.shim_dir)?, 0o500);
         Ok(())
     }
 
