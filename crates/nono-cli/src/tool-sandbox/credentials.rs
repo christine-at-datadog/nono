@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 
 /// Why a `local-socket` credential's socket could not be resolved at session start.
 ///
-/// The distinction decides whether the session continues. A socket that is
-/// merely absent is an ordinary runtime state, while a path that resolves to
-/// something other than a socket contradicts what the profile declared.
+/// The distinction decides whether the command continues. A socket that is
+/// merely absent is an ordinary runtime state. A path that resolves to
+/// something other than a socket, or whose state cannot be checked safely,
+/// contradicts what the profile declared and stays fatal.
 #[derive(Debug, Clone)]
 pub(crate) enum LocalSocketUnavailable {
     /// Nothing is listening at the configured location: the path template's
-    /// variable is unset, or it expanded to a path that no longer resolves.
+    /// variable is unset, or it expanded to a path that does not exist.
     /// Both are ordinary states for an agent socket — one that was never
     /// started, or one that exited and left a stale path behind — so the
     /// credential is omitted and commands that declare it still run.
@@ -24,13 +25,21 @@ pub(crate) enum LocalSocketUnavailable {
     /// asserted a socket lives here and that assertion is false, so this stays
     /// fatal rather than degrading into a silently omitted credential.
     NotASocket(String),
+    /// The socket's state could not be determined safely. Errors other than a
+    /// genuinely missing path (for example, permission denial or a symlink
+    /// loop) must stay fatal rather than being mistaken for ordinary absence.
+    CheckFailed(String),
 }
 
 impl LocalSocketUnavailable {
     pub(crate) fn reason(&self) -> &str {
         match self {
-            Self::Absent(reason) | Self::NotASocket(reason) => reason,
+            Self::Absent(reason) | Self::NotASocket(reason) | Self::CheckFailed(reason) => reason,
         }
+    }
+
+    pub(crate) fn is_fatal(&self) -> bool {
+        matches!(self, Self::NotASocket(_) | Self::CheckFailed(_))
     }
 }
 
@@ -47,10 +56,30 @@ impl LocalSocketUnavailable {
 /// the connect. That is fine, because losing the race costs a refused
 /// connection inside the command rather than a capability the command should
 /// not have had.
-pub(crate) fn local_socket_is_live(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|metadata| metadata.file_type().is_socket())
-        .unwrap_or(false)
+pub(crate) fn check_local_socket(path: &Path) -> std::result::Result<(), LocalSocketUnavailable> {
+    let metadata =
+        fs::metadata(path).map_err(|source| classify_path_error(path, "stat", source))?;
+    if metadata.file_type().is_socket() {
+        Ok(())
+    } else {
+        Err(LocalSocketUnavailable::NotASocket(format!(
+            "{} is not a socket",
+            path.display()
+        )))
+    }
+}
+
+fn classify_path_error(
+    path: &Path,
+    operation: &str,
+    source: std::io::Error,
+) -> LocalSocketUnavailable {
+    let reason = format!("failed to {operation} {}: {source}", path.display());
+    if source.kind() == std::io::ErrorKind::NotFound {
+        LocalSocketUnavailable::Absent(reason)
+    } else {
+        LocalSocketUnavailable::CheckFailed(reason)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,21 +231,13 @@ fn resolve_local_socket_path(value: &str) -> std::result::Result<PathBuf, LocalS
         NonoError::EnvVarValidation { var, .. } => {
             LocalSocketUnavailable::Absent(format!("{var} is unset"))
         }
-        other => LocalSocketUnavailable::Absent(other.to_string()),
+        other => LocalSocketUnavailable::CheckFailed(other.to_string()),
     })?;
     let path = PathBuf::from(expanded);
-    let canonical = path.canonicalize().map_err(|source| {
-        LocalSocketUnavailable::Absent(format!("failed to resolve {}: {source}", path.display()))
-    })?;
-    let metadata = fs::metadata(&canonical).map_err(|source| {
-        LocalSocketUnavailable::Absent(format!("failed to stat {}: {source}", canonical.display()))
-    })?;
-    if !metadata.file_type().is_socket() {
-        return Err(LocalSocketUnavailable::NotASocket(format!(
-            "{} is not a socket",
-            canonical.display()
-        )));
-    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| classify_path_error(&path, "resolve", source))?;
+    check_local_socket(&canonical)?;
     Ok(canonical)
 }
 
@@ -234,6 +255,9 @@ mod tests {
             LocalSocketUnavailable::Absent(reason) => reason,
             LocalSocketUnavailable::NotASocket(reason) => {
                 panic!("expected an absent socket, got not-a-socket: {reason}")
+            }
+            LocalSocketUnavailable::CheckFailed(reason) => {
+                panic!("expected an absent socket, got check failure: {reason}")
             }
         }
     }
@@ -345,7 +369,26 @@ mod tests {
             LocalSocketUnavailable::Absent(reason) => {
                 panic!("a regular file must not degrade to absent: {reason}")
             }
+            LocalSocketUnavailable::CheckFailed(reason) => {
+                panic!("a regular file must be classified directly: {reason}")
+            }
         }
+    }
+
+    #[test]
+    fn symlink_loop_is_a_fatal_check_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = tmp.path().join("first.sock");
+        let second = tmp.path().join("second.sock");
+        std::os::unix::fs::symlink(&second, &first).expect("first symlink");
+        std::os::unix::fs::symlink(&first, &second).expect("second symlink");
+
+        let err = resolve_local_socket_path(first.to_str().expect("utf8 path"))
+            .expect_err("a symlink loop must fail closed");
+        assert!(
+            matches!(err, LocalSocketUnavailable::CheckFailed(_)),
+            "unexpected classification: {err:?}"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::command_policy::{
 };
 use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{
-    LocalSocketUnavailable, ResolvedCredential, local_socket_is_live, resolve_credentials,
+    LocalSocketUnavailable, ResolvedCredential, check_local_socket, resolve_credentials,
 };
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
@@ -3826,26 +3826,29 @@ fn add_policy_credentials(
             Some(ResolvedCredential::LocalSocket {
                 path: Some(socket_path),
                 ..
-            }) if local_socket_is_live(socket_path) => {
-                caps.add_unix_socket(UnixSocketCapability::new_file(
-                    socket_path,
-                    UnixSocketMode::Connect,
-                )?);
-                caps.add_fs(FsCapability::new_file(socket_path, AccessMode::Read)?);
-            }
+            }) => match check_local_socket(socket_path) {
+                Ok(()) => {
+                    caps.add_unix_socket(UnixSocketCapability::new_file(
+                        socket_path,
+                        UnixSocketMode::Connect,
+                    )?);
+                    caps.add_fs(FsCapability::new_file(socket_path, AccessMode::Read)?);
+                }
+                Err(LocalSocketUnavailable::Absent(_)) => {}
+                Err(unavailable) => {
+                    return Err(local_socket_credential_error(handle, &unavailable));
+                }
+            },
             // A path that resolves to something other than a socket
             // contradicts what the profile declared, so it stays fatal — and
             // fatal here, per command, rather than at session start, so one
             // contradicted credential cannot take down commands that never
             // declared it.
             Some(ResolvedCredential::LocalSocket {
-                unavailable: Some(unavailable @ LocalSocketUnavailable::NotASocket(_)),
+                unavailable: Some(unavailable),
                 ..
-            }) => {
-                return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox credential '{handle}' is unavailable: {}",
-                    unavailable.reason()
-                )));
+            }) if unavailable.is_fatal() => {
+                return Err(local_socket_credential_error(handle, unavailable));
             }
             // An unavailable socket grants nothing rather than aborting the
             // command: either it was absent at session start, or it resolved
@@ -3867,6 +3870,13 @@ fn add_policy_credentials(
         }
     }
     Ok(())
+}
+
+fn local_socket_credential_error(handle: &str, unavailable: &LocalSocketUnavailable) -> NonoError {
+    NonoError::ConfigParse(format!(
+        "tool-sandbox credential '{handle}' is unavailable: {}",
+        unavailable.reason()
+    ))
 }
 
 fn resolve_policy_path(entry: &str, workdir: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -3958,7 +3968,9 @@ fn filter_child_env(
             env_var: Some(env_var),
             ..
         }) = state.credential_handles.get(cred_name)
-            && !path.as_deref().is_some_and(local_socket_is_live)
+            && path
+                .as_deref()
+                .is_none_or(|path| check_local_socket(path).is_err())
         {
             let prefix = format!("{env_var}=").into_bytes();
             result.retain(|entry| !entry.starts_with(&prefix));
@@ -3972,23 +3984,26 @@ fn filter_child_env(
                 path: Some(socket_path),
                 env_var,
                 ..
-            }) if local_socket_is_live(socket_path) => {
-                if let Some(env_var) = env_var {
-                    let prefix = format!("{env_var}=").into_bytes();
-                    result.retain(|entry| !entry.starts_with(&prefix));
-                    let mut entry = format!("{env_var}=").into_bytes();
-                    entry.extend_from_slice(socket_path.as_os_str().as_bytes());
-                    result.push(entry);
+            }) => match check_local_socket(socket_path) {
+                Ok(()) => {
+                    if let Some(env_var) = env_var {
+                        let prefix = format!("{env_var}=").into_bytes();
+                        result.retain(|entry| !entry.starts_with(&prefix));
+                        let mut entry = format!("{env_var}=").into_bytes();
+                        entry.extend_from_slice(socket_path.as_os_str().as_bytes());
+                        result.push(entry);
+                    }
                 }
-            }
+                Err(LocalSocketUnavailable::Absent(_)) => {}
+                Err(unavailable) => {
+                    return Err(local_socket_credential_error(cred_name, &unavailable));
+                }
+            },
             Some(ResolvedCredential::LocalSocket {
-                unavailable: Some(unavailable @ LocalSocketUnavailable::NotASocket(_)),
+                unavailable: Some(unavailable),
                 ..
-            }) => {
-                return Err(NonoError::ConfigParse(format!(
-                    "tool-sandbox credential '{cred_name}' is unavailable: {}",
-                    unavailable.reason()
-                )));
+            }) if unavailable.is_fatal() => {
+                return Err(local_socket_credential_error(cred_name, unavailable));
             }
             // Unavailable, and already stripped by the pass above; inject nothing.
             Some(ResolvedCredential::LocalSocket { .. }) => {}
@@ -9238,6 +9253,28 @@ mod tests {
             "a vanished socket must not leave its path in the child env: {env:?}"
         );
         Ok(())
+    }
+
+    /// A socket path replaced by a regular file is a contradictory declaration,
+    /// not ordinary absence, even when the replacement happens mid-session.
+    #[test]
+    fn socket_replaced_by_regular_file_mid_session_stays_fatal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("agent.sock");
+        std::fs::write(&socket_path, b"not a socket").expect("write replacement file");
+        let (state, policy) = state_and_policy_with_socket(Some(socket_path.clone()), None, None);
+        let request = request_with_env(vec![
+            format!("SSH_AUTH_SOCK={}", socket_path.display()).into_bytes(),
+        ]);
+
+        let mut caps = CapabilitySet::new();
+        let caps_err = add_policy_credentials(&mut caps, &state, &policy)
+            .expect_err("a non-socket replacement must fail capability construction");
+        assert!(caps_err.to_string().contains("is not a socket"));
+
+        let env_err = filter_child_env(&state, &request, &policy, &Caller::Session)
+            .expect_err("a non-socket replacement must fail environment construction");
+        assert!(env_err.to_string().contains("is not a socket"));
     }
 
     /// A path that contradicts the declaration stays fatal, and fails only the
